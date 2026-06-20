@@ -10,6 +10,7 @@ use esp_hal::{
         Error as I2cError,
         I2c,
     },
+    rmt::Rmt,
     time::Duration,
     time::Rate,
 };
@@ -67,6 +68,7 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     let delay = Delay::new();
+    let mut led_toggle = false;
 
     esp_println::println!("Controller Board initialized!");
 
@@ -76,6 +78,17 @@ fn main() -> ! {
         .with_sda(peripherals.GPIO6)
         .with_scl(peripherals.GPIO7);
 
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
+    let mut led = common_led::new_ws2812::<_, _, { common_led::LED_BUFFER_SIZE }>(
+        rmt.channel0,
+        peripherals.GPIO8,
+    )
+    .expect("Failed to initialize WS2812B LED");
+
+    if let Err(error) = common_led::set_rgb(&mut led, 0, 16, 0) {
+        esp_println::println!("Failed to set controller boot LED color: {:?}", error);
+    }
+
     scan_i2c_bus(&mut i2c);
 
     // TODO: Initialize communication (e.g. ESP-NOW) to connect with the vehicle
@@ -83,6 +96,14 @@ fn main() -> ! {
     loop {
         // Main control loop processing input
         esp_println::println!("Reading joystick state...");
+
+        let color = if led_toggle { (0, 0, 16) } else { (16, 0, 0) };
+        led_toggle = !led_toggle;
+
+        if let Err(error) = common_led::set_rgb(&mut led, color.0, color.1, color.2) {
+            esp_println::println!("Failed to update controller LED color: {:?}", error);
+        }
+
         delay.delay(Duration::from_millis(500));
     }
 }

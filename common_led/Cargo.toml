@@ -1,0 +1,9 @@
+[package]
+name = "common_led"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+esp-hal = { version = "1.1.1", features = ["esp32c6", "unstable"] }
+esp-hal-smartled = { package = "esp-hal-smartled2", version = "0.28.2", features = ["esp32c6"] }
+smart-leds-trait = "0.3.2"
