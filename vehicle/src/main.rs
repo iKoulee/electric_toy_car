@@ -38,16 +38,18 @@ fn main() -> ! {
 
     esp_println::println!("Main Vehicle Board initialized!");
 
-    // TODO: Initialize PWM for H-Bridge motor control
-    // TODO: Initialize communication (e.g. ESP-NOW) to receive instructions
+    // TODO(next): Initialize PWM for H-Bridge motor control and expose a stop command API.
+    // TODO(next): Provide an ESP32-C6 EspNowTransport implementation and create common_comms::espnow::VehicleLink.
+    // TODO(next): Configure accepted controller peer MAC (or peer table) before enabling RX.
 
     let watchdog = LinkWatchdog::new(LINK_TIMEOUT_MS);
     let mut elapsed_ms: u64 = 0;
     let mut last_state = LinkState::AwaitingFirstPacket;
 
     loop {
-        // TODO: Poll ESP-NOW receive queue and call watchdog.record_valid_packet(elapsed_ms)
-        //       whenever a fresh, checksum-valid control packet arrives.
+        // TODO(next): Poll VehicleLink::try_receive_control using an RX buffer each iteration.
+        // TODO(next): For every fresh packet, call watchdog.record_valid_packet(elapsed_ms)
+        //             and apply decoded control values to motor outputs.
         let state = watchdog.state(elapsed_ms);
 
         if state != last_state {
@@ -60,7 +62,7 @@ fn main() -> ! {
                 }
                 LinkState::TimedOut => {
                     esp_println::println!("Vehicle link state: timed out, entering fail-safe stop");
-                    // TODO: Immediately command H-bridge stop state here.
+                    // TODO(next): Immediately command H-bridge stop state here.
                 }
             }
             last_state = state;

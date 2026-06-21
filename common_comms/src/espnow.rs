@@ -5,6 +5,9 @@ use crate::protocol::{
     is_newer_sequence,
 };
 
+// TODO(next): Implement a board-specific EspNowTransport adapter in controller/vehicle crates
+//             and pass it into ControllerLink/VehicleLink.
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct ReceivedMeta {
     pub peer_mac: [u8; 6],

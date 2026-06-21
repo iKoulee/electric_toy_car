@@ -500,7 +500,9 @@ fn main() -> ! {
         );
     }
 
-    // TODO: Initialize communication (e.g. ESP-NOW) to connect with the vehicle
+    // TODO(next): Provide an ESP32-C6 EspNowTransport implementation and initialize it here.
+    // TODO(next): Configure the vehicle peer MAC and create common_comms::espnow::ControllerLink.
+    // TODO(next): Send one ControlPacket every loop as heartbeat/control, and send neutral packet on read errors.
 
     let mut sample_seq: u32 = 0;
     let mut last_state = JoystickState {
