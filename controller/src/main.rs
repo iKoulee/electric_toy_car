@@ -604,7 +604,7 @@ async fn main(_spawner: Spawner) -> ! {
 
                 last_sampled_state = Some(state);
 
-                if ticks_since_status_log >= JOYSTICK_STATUS_LOG_INTERVAL_MS {
+                if changed && ticks_since_status_log >= JOYSTICK_STATUS_LOG_INTERVAL_MS {
                     print_joystick_status(&state, consecutive_read_failures);
                     ticks_since_status_log = 0;
                 }
