@@ -30,7 +30,8 @@ Checksum rule:
 
 ## Keepalive and timeout
 
-- Transmit interval target: `100 ms` (`CONTROL_TX_INTERVAL_MS`)
+- Transmit policy: send immediately on control-state change and also emit periodic keepalive packets.
+- Keepalive interval target: `100 ms` (`CONTROL_TX_INTERVAL_MS`)
 - Vehicle timeout threshold: `500 ms` (`LINK_TIMEOUT_MS`)
 
 The command stream itself is the keepalive. No separate heartbeat frame is required.

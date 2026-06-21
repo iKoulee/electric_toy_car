@@ -5,6 +5,13 @@ use common_comms::protocol::{
     CONTROL_TX_INTERVAL_MS,
     ControlPacket,
 };
+use embassy_executor::Spawner;
+use embassy_time::{
+    Duration as EmbassyDuration,
+    TimeoutError,
+    Timer,
+    with_timeout,
+};
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
@@ -14,7 +21,9 @@ use esp_hal::{
         Error as I2cError,
         I2c,
     },
+    interrupt::software::SoftwareInterruptControl,
     rmt::Rmt,
+    timer::timg::TimerGroup,
     time::Duration,
     time::Rate,
 };
@@ -23,8 +32,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 const I2C_SCAN_START_ADDR: u8 = 0x10;
 const I2C_SCAN_END_ADDR: u8 = 0x77;
-const I2C_FREQUENCY_KHZ: u32 = 10;
-const RUN_I2C_SCAN: bool = false;
+const I2C_FREQUENCY_KHZ: u32 = 100;
+const RUN_I2C_SCAN: bool = true;
 const RUN_STARTUP_PROBES: bool = false;
 const JOYSTICK_DEFAULT_ADDRESS: u8 = 0x5A;
 const JOYSTICK_ADDRESS: u8 = 0x24;
@@ -38,7 +47,9 @@ const JOYSTICK_CANDIDATE_ADDRESSES: [u8; 4] = [
     JOYSTICK_ADDRESS_ALT_2,
 ];
 const JOYSTICK_START_REGISTER: u8 = 0x00;
-const JOYSTICK_PRINT_ON_CHANGE_ONLY: bool = false;
+const JOYSTICK_PRINT_ON_CHANGE_ONLY: bool = true;
+const JOYSTICK_SAMPLE_LOGS_ENABLED: bool = false;
+const CONTROL_TX_LOGS_ENABLED: bool = false;
 const JOYSTICK_RUNTIME_START_REGISTER: u8 = 0x10;
 const JOYSTICK_RUNTIME_FRAME_LEN: usize = 0x26; // Registers 0x10..=0x35
 const JOYSTICK_PROBE_WINDOW_SIZE: usize = 8;
@@ -49,6 +60,12 @@ const JOYSTICK_PROBE_WINDOWS: [u8; JOYSTICK_PROBE_WINDOW_COUNT] = [
 const JOYSTICK_PROBE_SAMPLES: u8 = 30;
 const JOYSTICK_PROBE_INTERVAL_MS: u64 = 50;
 const JOYSTICK_PROBE_MAX_CHANGE_PRINTS: u16 = 64;
+const CONTROL_LOOP_TICK_MS: u64 = 10;
+// At 10kHz, a write_read of 38-byte frame can exceed 30ms; keep timeout above transfer worst-case.
+const JOYSTICK_READ_TIMEOUT_MS: u64 = 80;
+const READ_FAILURES_BEFORE_NEUTRAL_KEEPALIVE: u8 = 3;
+const JOYSTICK_ERROR_LOG_PERIOD: u8 = 10;
+const JOYSTICK_STATUS_LOG_INTERVAL_MS: u64 = 250;
 
 #[derive(Copy, Clone)]
 struct I2cScanSummary {
@@ -114,15 +131,25 @@ fn try_read_joystick_runtime_frame_at(
     Ok(data)
 }
 
-fn read_joystick_runtime_frame(
-    i2c: &mut I2c<'_, esp_hal::Blocking>,
+async fn try_read_joystick_runtime_frame_at_async(
+    i2c: &mut I2c<'_, esp_hal::Async>,
+    address: u8,
+) -> Result<[u8; JOYSTICK_RUNTIME_FRAME_LEN], I2cError> {
+    let mut data = [0u8; JOYSTICK_RUNTIME_FRAME_LEN];
+    i2c.write_read_async(address, &[JOYSTICK_RUNTIME_START_REGISTER], &mut data)
+        .await?;
+    Ok(data)
+}
+
+async fn read_joystick_runtime_frame_async(
+    i2c: &mut I2c<'_, esp_hal::Async>,
     preferred_address: Option<u8>,
 ) -> Result<(u8, [u8; JOYSTICK_RUNTIME_FRAME_LEN]), I2cError> {
     let mut first_error: Option<I2cError> = None;
 
     if let Some(address) = preferred_address {
         if !JOYSTICK_CANDIDATE_ADDRESSES.contains(&address) {
-            match try_read_joystick_runtime_frame_at(i2c, address) {
+            match try_read_joystick_runtime_frame_at_async(i2c, address).await {
                 Ok(sample) => return Ok((address, sample)),
                 Err(error) => first_error = Some(error),
             }
@@ -130,7 +157,7 @@ fn read_joystick_runtime_frame(
     }
 
     for address in JOYSTICK_CANDIDATE_ADDRESSES {
-        match try_read_joystick_runtime_frame_at(i2c, address) {
+        match try_read_joystick_runtime_frame_at_async(i2c, address).await {
             Ok(sample) => return Ok((address, sample)),
             Err(error) => {
                 if first_error.is_none() {
@@ -142,7 +169,7 @@ fn read_joystick_runtime_frame(
 
     if let Some(address) = preferred_address {
         if JOYSTICK_CANDIDATE_ADDRESSES.contains(&address) {
-            match try_read_joystick_runtime_frame_at(i2c, address) {
+            match try_read_joystick_runtime_frame_at_async(i2c, address).await {
                 Ok(sample) => return Ok((address, sample)),
                 Err(error) => {
                     if first_error.is_none() {
@@ -196,10 +223,12 @@ fn print_runtime_state(
     address: u8,
     state: &JoystickState,
     packet: &ControlPacket,
+    reason: &str,
 ) {
     esp_println::println!(
-        "Joystick sample #{:08} from 0x{:02X}: x={} y={} buttons=[JOY:{} C:{} A:{} B:{} D:{}] raw_btn={:02X?} pkt={:02X?}",
+        "Joystick tx #{:08} ({}) from 0x{:02X}: x={} y={} buttons=[JOY:{} C:{} A:{} B:{} D:{}] raw_btn={:02X?} pkt={:02X?}",
         seq,
+        reason,
         address,
         state.x,
         state.y,
@@ -211,6 +240,35 @@ fn print_runtime_state(
         state.raw_buttons,
         packet.to_bytes(),
     );
+}
+
+fn print_joystick_status(state: &JoystickState, consecutive_read_failures: u8) {
+    esp_println::println!(
+        "Joystick status: x={} y={} buttons=[JOY:{} C:{} A:{} B:{} D:{}] failures={}",
+        state.x,
+        state.y,
+        if state.buttons.joy { "P" } else { "R" },
+        if state.buttons.c { "P" } else { "R" },
+        if state.buttons.a { "P" } else { "R" },
+        if state.buttons.b { "P" } else { "R" },
+        if state.buttons.d { "P" } else { "R" },
+        consecutive_read_failures,
+    );
+}
+
+const fn neutral_joystick_state() -> JoystickState {
+    JoystickState {
+        x: 128,
+        y: 128,
+        buttons: JoystickButtons {
+            joy: false,
+            c: false,
+            a: false,
+            b: false,
+            d: false,
+        },
+        raw_buttons: [0; 5],
+    }
 }
 
 fn print_probe_result(op: &str, address: u8, result: Result<(), I2cError>) {
@@ -432,9 +490,12 @@ fn resolve_active_joystick_address(
     None
 }
 
-#[esp_hal::main]
-fn main() -> ! {
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, software_interrupt.software_interrupt0);
 
     let delay = Delay::new();
     let mut led_toggle = false;
@@ -500,50 +561,111 @@ fn main() -> ! {
         );
     }
 
+    let mut i2c = i2c.into_async();
+
     // TODO(next): Provide an ESP32-C6 EspNowTransport implementation and initialize it here.
     // TODO(next): Configure the vehicle peer MAC and create common_comms::espnow::ControllerLink.
-    // TODO(next): Send one ControlPacket every loop as heartbeat/control, and send neutral packet on read errors.
+    // TODO(next): Forward packets generated on change/keepalive via ControllerLink; on repeated read errors,
+    //            send neutral keepalive packets to preserve fail-safe behavior.
 
-    let mut sample_seq: u32 = 0;
-    let mut last_state = JoystickState {
-        x: 0,
-        y: 0,
-        buttons: JoystickButtons {
-            joy: false,
-            c: false,
-            a: false,
-            b: false,
-            d: false,
-        },
-        raw_buttons: [0; 5],
-    };
-    let mut has_last_state = false;
+    let mut tx_seq: u16 = 0;
+    let mut last_sampled_state: Option<JoystickState> = None;
+    let mut last_transmitted_state: Option<JoystickState> = None;
+    let mut ticks_since_tx: u64 = CONTROL_TX_INTERVAL_MS;
+    let mut consecutive_read_failures: u8 = 0;
+    let mut ticks_since_status_log: u64 = JOYSTICK_STATUS_LOG_INTERVAL_MS;
 
     loop {
-        // Main control loop processing input
-        sample_seq = sample_seq.wrapping_add(1);
+        // Cooperative control scheduling: fast sampling + event-driven TX + periodic keepalive.
+        let mut tx_reason: Option<&str> = None;
+        let mut tx_state = last_transmitted_state.unwrap_or_else(neutral_joystick_state);
 
-        match read_joystick_runtime_frame(&mut i2c, active_joystick_address) {
-            Ok((address, frame)) => {
+        match with_timeout(
+            EmbassyDuration::from_millis(JOYSTICK_READ_TIMEOUT_MS),
+            read_joystick_runtime_frame_async(&mut i2c, active_joystick_address),
+        )
+        .await
+        {
+            Ok(Ok((address, frame))) => {
                 let state = decode_joystick_state(&frame);
-                let button_mask = encode_buttons(&state.buttons);
-                let packet = ControlPacket::new(sample_seq as u16, state.x, state.y, button_mask);
-                let should_print = !JOYSTICK_PRINT_ON_CHANGE_ONLY || !has_last_state || state != last_state;
+                let changed = last_sampled_state != Some(state);
+                consecutive_read_failures = 0;
 
-                if should_print {
-                    print_runtime_state(sample_seq, address, &state, &packet);
+                if changed {
+                    tx_reason = Some("change");
+                    tx_state = state;
                 }
 
-                last_state = state;
-                has_last_state = true;
+                if JOYSTICK_SAMPLE_LOGS_ENABLED && (!JOYSTICK_PRINT_ON_CHANGE_ONLY || changed) {
+                    let button_mask = encode_buttons(&state.buttons);
+                    let preview = ControlPacket::new(tx_seq, state.x, state.y, button_mask);
+                    print_runtime_state(tx_seq as u32, address, &state, &preview, "sample");
+                }
+
+                last_sampled_state = Some(state);
+
+                if ticks_since_status_log >= JOYSTICK_STATUS_LOG_INTERVAL_MS {
+                    print_joystick_status(&state, consecutive_read_failures);
+                    ticks_since_status_log = 0;
+                }
             }
-            Err(error) => {
-                esp_println::println!(
-                    "Joystick read failed at 0x{:02X}: {}",
+            Ok(Err(error)) => {
+                consecutive_read_failures = consecutive_read_failures.saturating_add(1);
+                if consecutive_read_failures == 1
+                    || consecutive_read_failures % JOYSTICK_ERROR_LOG_PERIOD == 0
+                {
+                    esp_println::println!(
+                        "Joystick read failed at 0x{:02X}: {} (consecutive={})",
+                        active_joystick_address.unwrap_or(JOYSTICK_DEFAULT_ADDRESS),
+                        error,
+                        consecutive_read_failures
+                    );
+                }
+            }
+            Err(TimeoutError) => {
+                consecutive_read_failures = consecutive_read_failures.saturating_add(1);
+                if consecutive_read_failures == 1
+                    || consecutive_read_failures % JOYSTICK_ERROR_LOG_PERIOD == 0
+                {
+                    esp_println::println!(
+                        "Joystick read timed out at 0x{:02X} after {} ms (consecutive={})",
+                        active_joystick_address.unwrap_or(JOYSTICK_DEFAULT_ADDRESS),
+                        JOYSTICK_READ_TIMEOUT_MS,
+                        consecutive_read_failures
+                    );
+                }
+            }
+        }
+
+        if tx_reason.is_none() && ticks_since_tx >= CONTROL_TX_INTERVAL_MS {
+            if consecutive_read_failures >= READ_FAILURES_BEFORE_NEUTRAL_KEEPALIVE {
+                tx_reason = Some("keepalive-neutral");
+                tx_state = neutral_joystick_state();
+            } else {
+                tx_reason = Some("keepalive");
+                tx_state = last_sampled_state.unwrap_or_else(neutral_joystick_state);
+            }
+        }
+
+        if let Some(reason) = tx_reason {
+            tx_seq = tx_seq.wrapping_add(1);
+            let button_mask = encode_buttons(&tx_state.buttons);
+            let packet = ControlPacket::new(tx_seq, tx_state.x, tx_state.y, button_mask);
+
+            // TODO(next): Send packet via ControllerLink once EspNowTransport is wired.
+            // For bring-up we still log packet intent and reason.
+            if CONTROL_TX_LOGS_ENABLED {
+                print_runtime_state(
+                    tx_seq as u32,
                     active_joystick_address.unwrap_or(JOYSTICK_DEFAULT_ADDRESS),
-                    error
+                    &tx_state,
+                    &packet,
+                    reason,
                 );
             }
+
+            last_transmitted_state = Some(tx_state);
+            ticks_since_tx = 0;
         }
 
         let color = if led_toggle { (0, 0, 16) } else { (16, 0, 0) };
@@ -553,6 +675,8 @@ fn main() -> ! {
             esp_println::println!("Failed to update controller LED color: {:?}", error);
         }
 
-        delay.delay(Duration::from_millis(CONTROL_TX_INTERVAL_MS));
+        Timer::after_millis(CONTROL_LOOP_TICK_MS).await;
+        ticks_since_tx = ticks_since_tx.saturating_add(CONTROL_LOOP_TICK_MS);
+        ticks_since_status_log = ticks_since_status_log.saturating_add(CONTROL_LOOP_TICK_MS);
     }
 }
