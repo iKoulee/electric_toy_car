@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+use common_comms::protocol::{
+    CONTROL_TX_INTERVAL_MS,
+    ControlPacket,
+};
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
@@ -34,7 +38,6 @@ const JOYSTICK_CANDIDATE_ADDRESSES: [u8; 4] = [
     JOYSTICK_ADDRESS_ALT_2,
 ];
 const JOYSTICK_START_REGISTER: u8 = 0x00;
-const JOYSTICK_POLL_INTERVAL_MS: u64 = 100;
 const JOYSTICK_PRINT_ON_CHANGE_ONLY: bool = false;
 const JOYSTICK_RUNTIME_START_REGISTER: u8 = 0x10;
 const JOYSTICK_RUNTIME_FRAME_LEN: usize = 0x26; // Registers 0x10..=0x35
@@ -70,74 +73,26 @@ struct JoystickState {
     raw_buttons: [u8; 5],
 }
 
-#[repr(C, packed)]
-#[derive(Copy, Clone, Eq, PartialEq)]
-struct ControllerInputPacket {
-    sequence: u16,
-    x: u8,
-    y: u8,
-    buttons: u8,
-    reserved: u8,
-    checksum: u8,
-}
+fn encode_buttons(buttons: &JoystickButtons) -> u8 {
+    let mut packed = 0u8;
 
-impl ControllerInputPacket {
-    const LEN: usize = 7;
-    const BUTTON_JOY: u8 = 1 << 0;
-    const BUTTON_C: u8 = 1 << 1;
-    const BUTTON_A: u8 = 1 << 2;
-    const BUTTON_B: u8 = 1 << 3;
-    const BUTTON_D: u8 = 1 << 4;
-
-    fn from_state(sequence: u16, state: &JoystickState) -> Self {
-        let mut buttons = 0u8;
-
-        if state.buttons.joy {
-            buttons |= Self::BUTTON_JOY;
-        }
-        if state.buttons.c {
-            buttons |= Self::BUTTON_C;
-        }
-        if state.buttons.a {
-            buttons |= Self::BUTTON_A;
-        }
-        if state.buttons.b {
-            buttons |= Self::BUTTON_B;
-        }
-        if state.buttons.d {
-            buttons |= Self::BUTTON_D;
-        }
-
-        let mut packet = Self {
-            sequence,
-            x: state.x,
-            y: state.y,
-            buttons,
-            reserved: 0,
-            checksum: 0,
-        };
-
-        packet.checksum = packet.compute_checksum();
-        packet
+    if buttons.joy {
+        packed |= ControlPacket::BUTTON_JOY;
+    }
+    if buttons.c {
+        packed |= ControlPacket::BUTTON_C;
+    }
+    if buttons.a {
+        packed |= ControlPacket::BUTTON_A;
+    }
+    if buttons.b {
+        packed |= ControlPacket::BUTTON_B;
+    }
+    if buttons.d {
+        packed |= ControlPacket::BUTTON_D;
     }
 
-    fn compute_checksum(&self) -> u8 {
-        let [seq_lo, seq_hi] = self.sequence.to_le_bytes();
-        seq_lo ^ seq_hi ^ self.x ^ self.y ^ self.buttons ^ self.reserved
-    }
-
-    fn to_bytes(self) -> [u8; Self::LEN] {
-        let [seq_lo, seq_hi] = self.sequence.to_le_bytes();
-        [
-            seq_lo,
-            seq_hi,
-            self.x,
-            self.y,
-            self.buttons,
-            self.reserved,
-            self.checksum,
-        ]
-    }
+    packed
 }
 
 fn device_responded(i2c: &mut I2c<'_, esp_hal::Blocking>, address: u8) -> Result<bool, I2cError> {
@@ -240,7 +195,7 @@ fn print_runtime_state(
     seq: u32,
     address: u8,
     state: &JoystickState,
-    packet: &ControllerInputPacket,
+    packet: &ControlPacket,
 ) {
     esp_println::println!(
         "Joystick sample #{:08} from 0x{:02X}: x={} y={} buttons=[JOY:{} C:{} A:{} B:{} D:{}] raw_btn={:02X?} pkt={:02X?}",
@@ -569,7 +524,8 @@ fn main() -> ! {
         match read_joystick_runtime_frame(&mut i2c, active_joystick_address) {
             Ok((address, frame)) => {
                 let state = decode_joystick_state(&frame);
-                let packet = ControllerInputPacket::from_state(sample_seq as u16, &state);
+                let button_mask = encode_buttons(&state.buttons);
+                let packet = ControlPacket::new(sample_seq as u16, state.x, state.y, button_mask);
                 let should_print = !JOYSTICK_PRINT_ON_CHANGE_ONLY || !has_last_state || state != last_state;
 
                 if should_print {
@@ -595,6 +551,6 @@ fn main() -> ! {
             esp_println::println!("Failed to update controller LED color: {:?}", error);
         }
 
-        delay.delay(Duration::from_millis(JOYSTICK_POLL_INTERVAL_MS));
+        delay.delay(Duration::from_millis(CONTROL_TX_INTERVAL_MS));
     }
 }

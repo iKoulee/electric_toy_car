@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "common_comms",
     "common_led",
     "controller",
     "vehicle"

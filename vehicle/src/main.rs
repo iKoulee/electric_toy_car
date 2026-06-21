@@ -1,6 +1,11 @@
 #![no_std]
 #![no_main]
 
+use common_comms::{
+    LinkState,
+    LinkWatchdog,
+    LINK_TIMEOUT_MS,
+};
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
@@ -10,6 +15,8 @@ use esp_hal::{
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+const VEHICLE_LOOP_INTERVAL_MS: u64 = 50;
 
 #[esp_hal::main]
 fn main() -> ! {
@@ -34,17 +41,50 @@ fn main() -> ! {
     // TODO: Initialize PWM for H-Bridge motor control
     // TODO: Initialize communication (e.g. ESP-NOW) to receive instructions
 
-    loop {
-        // Main drive loop listening to commands and handling fail-safes
-        esp_println::println!("Checking connection state and updating motors...");
+    let watchdog = LinkWatchdog::new(LINK_TIMEOUT_MS);
+    let mut elapsed_ms: u64 = 0;
+    let mut last_state = LinkState::AwaitingFirstPacket;
 
-        let color = if led_toggle { (0, 0, 16) } else { (16, 0, 0) };
-        led_toggle = !led_toggle;
+    loop {
+        // TODO: Poll ESP-NOW receive queue and call watchdog.record_valid_packet(elapsed_ms)
+        //       whenever a fresh, checksum-valid control packet arrives.
+        let state = watchdog.state(elapsed_ms);
+
+        if state != last_state {
+            match state {
+                LinkState::AwaitingFirstPacket => {
+                    esp_println::println!("Vehicle link state: waiting for first control packet");
+                }
+                LinkState::Alive => {
+                    esp_println::println!("Vehicle link state: alive");
+                }
+                LinkState::TimedOut => {
+                    esp_println::println!("Vehicle link state: timed out, entering fail-safe stop");
+                    // TODO: Immediately command H-bridge stop state here.
+                }
+            }
+            last_state = state;
+        }
+
+        let color = match state {
+            LinkState::AwaitingFirstPacket => (16, 12, 0),
+            LinkState::Alive => (0, 16, 0),
+            LinkState::TimedOut => {
+                let blink = led_toggle;
+                led_toggle = !led_toggle;
+                if blink {
+                    (16, 0, 0)
+                } else {
+                    (2, 0, 0)
+                }
+            }
+        };
 
         if let Err(error) = common_led::set_rgb(&mut led, color.0, color.1, color.2) {
             esp_println::println!("Failed to update vehicle LED color: {:?}", error);
         }
 
-        delay.delay(Duration::from_millis(500));
+        delay.delay(Duration::from_millis(VEHICLE_LOOP_INTERVAL_MS));
+        elapsed_ms = elapsed_ms.saturating_add(VEHICLE_LOOP_INTERVAL_MS);
     }
 }
