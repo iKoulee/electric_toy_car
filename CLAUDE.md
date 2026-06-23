@@ -1,0 +1,69 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Dual-ESP32-C6 firmware for a remote-controlled electric toy car. Two boards communicate via ESP-NOW:
+- **Controller board** — reads an I2C joystick, transmits `ControlPacket` at 100 ms keepalive intervals
+- **Vehicle board** — receives packets, drives motors via H-bridge, stops motors on link timeout (fail-safe)
+
+## Build & Flash Commands
+
+```bash
+# Check all crates
+cargo check
+
+# Build a specific board (release is required for flashing)
+cargo build -p controller --release
+cargo build -p vehicle --release
+
+# Flash via espflash (configured as cargo runner in .cargo/config.toml)
+cargo run -p controller --release
+cargo run -p vehicle --release
+
+# Run host-side tests (common_comms only — no hardware needed)
+cargo test -p common_comms
+```
+
+Target: `riscv32imac-unknown-none-elf` (ESP32-C6). The runner `espflash flash --monitor` is wired in `.cargo/config.toml`, so `cargo run` flashes and opens the serial monitor.
+
+## Workspace Crates
+
+| Crate | Role |
+|---|---|
+| `common_comms` | Protocol, ESP-NOW transport trait, link watchdog — fully testable on host |
+| `common_led` | WS2812B LED helper via RMT (`set_rgb`) |
+| `controller` | Async firmware (Embassy + esp-rtos): joystick → TX |
+| `vehicle` | Sync firmware: RX → motor control (fail-safe supervised) |
+
+## Architecture
+
+### Communication protocol (`common_comms`)
+- `ControlPacket` is 8 bytes, little-endian: `seq: u16`, `x: u8`, `y: u8`, `buttons: u8`, `reserved: [u8; 3]`
+- Sequence freshness: delta must be in `(0, 0x8000)` — drops stale/replayed packets
+- `EspNowTransport` trait abstracts the transport; `ControllerLink` (TX) and `VehicleLink` (RX) are thin wrappers around it — both are testable without hardware via mock implementations
+- `LinkWatchdog` is a pure state machine (`AwaitingFirstPacket → Alive → TimedOut`) driven by elapsed-time updates; timeout threshold is `LINK_TIMEOUT_MS = 500`
+
+### Controller (`controller/src/main.rs`)
+- Async with `esp_rtos::main` and Embassy executor
+- I2C0 on GPIO6/GPIO7 at 100 kHz; joystick detected by scanning addresses `[0x5A, 0x24, 0x12, 0x48]`
+- 10 ms tick loop; transmits on state change or every 100 ms (keepalive); sends neutral packet after 3+ consecutive I2C failures
+- **TODO:** Wire up `ControllerLink` with the actual ESP-NOW peripheral
+
+### Vehicle (`vehicle/src/main.rs`)
+- Synchronous with `esp_hal::main`; 50 ms tick loop
+- LED reflects link state: Yellow = awaiting, Green = alive, Red blink = timed out (fail-safe)
+- **TODO:** Poll `VehicleLink::try_receive_control()` each tick; implement PWM H-bridge; stop motors on `TimedOut`
+
+### Shared LED (`common_led`)
+- `new_ws2812(rmt_channel, gpio_pin, clocks)` → `SmartLedsAdapter`
+- `set_rgb(led, r, g, b)` — single WS2812B on GPIO8 (RMT)
+
+## Embedded Constraints
+
+- **No `std`**, no heap allocation in hot paths, no blocking delays in control loops
+- Motor H-bridge PWM must include dead-time to prevent shoot-through
+- All hardware bus errors (I2C, ESP-NOW) must be handled — never panic in production paths
+- RISC-V only — do not suggest Xtensa-specific features or assembly
+- Controller uses async (`embassy-executor`); vehicle uses sync — keep this split intentional
