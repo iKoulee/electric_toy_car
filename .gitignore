@@ -10,9 +10,10 @@
 
 # Editor directories and files
 .vscode/*
-!.vscode/settings.json
+#!.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 *.swp
 *.swo
 .DS_Store
+

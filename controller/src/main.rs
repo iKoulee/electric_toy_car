@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+mod esp_now_transport;
+
+use common_comms::espnow::ControllerLink;
+use esp_radio::esp_now::BROADCAST_ADDRESS;
 use common_comms::protocol::{
     CONTROL_TX_INTERVAL_MS,
     ControlPacket,
@@ -493,9 +497,22 @@ fn resolve_active_joystick_address(
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    esp_alloc::heap_allocator!(size: 64 * 1024);
+
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, software_interrupt.software_interrupt0);
+
+    let esp_radio_ctrl = esp_radio::init().expect("Radio init failed");
+    let (mut wifi_ctrl, interfaces) =
+        esp_radio::wifi::new(&esp_radio_ctrl, peripherals.WIFI, Default::default())
+            .expect("ESP-NOW/WiFi init failed");
+    wifi_ctrl
+        .set_mode(esp_radio::wifi::WifiMode::Sta)
+        .expect("WiFi set mode failed");
+    wifi_ctrl.start().expect("WiFi start failed");
+    let esp_now = interfaces.esp_now;
 
     let delay = Delay::new();
     let mut led_toggle = false;
@@ -510,11 +527,8 @@ async fn main(_spawner: Spawner) -> ! {
         .with_scl(peripherals.GPIO7);
 
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
-    let mut led = common_led::new_ws2812::<_, _, { common_led::LED_BUFFER_SIZE }>(
-        rmt.channel0,
-        peripherals.GPIO8,
-    )
-    .expect("Failed to initialize WS2812B LED");
+    let mut led_buf = common_led::ws2812_buffer!();
+    let mut led = common_led::new_ws2812(rmt.channel0, peripherals.GPIO8, &mut led_buf);
 
     if let Err(error) = common_led::set_rgb(&mut led, 0, 16, 0) {
         esp_println::println!("Failed to set controller boot LED color: {:?}", error);
@@ -563,10 +577,8 @@ async fn main(_spawner: Spawner) -> ! {
 
     let mut i2c = i2c.into_async();
 
-    // TODO(next): Provide an ESP32-C6 EspNowTransport implementation and initialize it here.
-    // TODO(next): Configure the vehicle peer MAC and create common_comms::espnow::ControllerLink.
-    // TODO(next): Forward packets generated on change/keepalive via ControllerLink; on repeated read errors,
-    //            send neutral keepalive packets to preserve fail-safe behavior.
+    let transport = esp_now_transport::Esp32C6EspNow::new(esp_now);
+    let mut link = ControllerLink::new(transport, BROADCAST_ADDRESS);
 
     let mut tx_seq: u16 = 0;
     let mut last_sampled_state: Option<JoystickState> = None;
@@ -652,8 +664,10 @@ async fn main(_spawner: Spawner) -> ! {
             let button_mask = encode_buttons(&tx_state.buttons);
             let packet = ControlPacket::new(tx_seq, tx_state.x, tx_state.y, button_mask);
 
-            // TODO(next): Send packet via ControllerLink once EspNowTransport is wired.
-            // For bring-up we still log packet intent and reason.
+            if let Err(e) = link.send_control(packet) {
+                esp_println::println!("ESP-NOW send error: {:?}", e);
+            }
+
             if CONTROL_TX_LOGS_ENABLED {
                 print_runtime_state(
                     tx_seq as u32,
