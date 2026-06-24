@@ -17,5 +17,7 @@ esp-backtrace = { version = "0.19.0", features = [
 esp-println = { version = "0.17.0", features = ["esp32c6", "log-04"] }
 log = { version = "0.4.21" }
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c6"] }
-esp-rtos = { version = "0.2", features = ["esp32c6", "esp-radio"] }
+esp-rtos = { version = "0.2", features = ["embassy", "esp32c6", "esp-radio"] }
+embassy-executor = "0.9"
+embassy-time = "0.5"
 esp-radio = { git = "https://github.com/esp-rs/esp-hal", tag = "esp-hal-v1.0.0", package = "esp-radio", default-features = false, features = ["esp32c6", "esp-now", "unstable", "wifi"] }
