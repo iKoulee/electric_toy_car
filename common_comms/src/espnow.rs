@@ -70,6 +70,10 @@ impl<T: EspNowTransport> VehicleLink<T> {
         }
     }
 
+    pub fn reset_sequence(&mut self) {
+        self.last_sequence = None;
+    }
+
     pub fn try_receive_control(
         &mut self,
         rx_buffer: &mut [u8; CONTROL_PACKET_LEN],
