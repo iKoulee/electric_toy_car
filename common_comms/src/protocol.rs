@@ -1,4 +1,4 @@
-pub const CONTROL_PACKET_LEN: usize = 7;
+pub const CONTROL_PACKET_LEN: usize = 8;
 pub const CONTROL_TX_INTERVAL_MS: u64 = 100;
 pub const LINK_TIMEOUT_MS: u64 = 500;
 
@@ -9,14 +9,12 @@ pub struct ControlPacket {
     pub x: u8,
     pub y: u8,
     pub buttons: u8,
-    pub reserved: u8,
-    pub checksum: u8,
+    pub reserved: [u8; 3],
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum PacketError {
     InvalidLength,
-    BadChecksum,
 }
 
 impl ControlPacket {
@@ -27,21 +25,13 @@ impl ControlPacket {
     pub const BUTTON_D: u8 = 1 << 4;
 
     pub fn new(sequence: u16, x: u8, y: u8, buttons: u8) -> Self {
-        let mut packet = Self {
+        Self {
             sequence,
             x,
             y,
             buttons,
-            reserved: 0,
-            checksum: 0,
-        };
-        packet.checksum = packet.compute_checksum();
-        packet
-    }
-
-    pub fn compute_checksum(&self) -> u8 {
-        let [seq_lo, seq_hi] = self.sequence.to_le_bytes();
-        seq_lo ^ seq_hi ^ self.x ^ self.y ^ self.buttons ^ self.reserved
+            reserved: [0; 3],
+        }
     }
 
     pub fn to_bytes(self) -> [u8; CONTROL_PACKET_LEN] {
@@ -52,8 +42,9 @@ impl ControlPacket {
             self.x,
             self.y,
             self.buttons,
-            self.reserved,
-            self.checksum,
+            self.reserved[0],
+            self.reserved[1],
+            self.reserved[2],
         ]
     }
 
@@ -62,20 +53,13 @@ impl ControlPacket {
             return Err(PacketError::InvalidLength);
         }
 
-        let packet = Self {
+        Ok(Self {
             sequence: u16::from_le_bytes([bytes[0], bytes[1]]),
             x: bytes[2],
             y: bytes[3],
             buttons: bytes[4],
-            reserved: bytes[5],
-            checksum: bytes[6],
-        };
-
-        if packet.compute_checksum() != packet.checksum {
-            return Err(PacketError::BadChecksum);
-        }
-
-        Ok(packet)
+            reserved: [bytes[5], bytes[6], bytes[7]],
+        })
     }
 }
 
