@@ -10,6 +10,12 @@ resolver = "2"
 [profile.dev]
 opt-level = "s"
 
+[patch.crates-io]
+esp-hal-smartled = { path = "vendor/esp-hal-smartled" }
+esp-hal = { git = "https://github.com/esp-rs/esp-hal", tag = "esp-hal-v1.0.0", package = "esp-hal" }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", tag = "esp-hal-v1.0.0", package = "esp-bootloader-esp-idf" }
+esp-rtos = { git = "https://github.com/esp-rs/esp-hal", tag = "esp-hal-v1.0.0", package = "esp-rtos" }
+
 [profile.release]
 codegen-units = 1
 debug = 2
