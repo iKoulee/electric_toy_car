@@ -513,11 +513,12 @@ async fn main(_spawner: Spawner) -> ! {
         .expect("WiFi set mode failed");
     wifi_ctrl.start().expect("WiFi start failed");
     let esp_now = interfaces.esp_now;
+    esp_now.set_channel(1).expect("Failed to set ESP-NOW channel");
 
     let delay = Delay::new();
     let mut led_toggle = false;
 
-    esp_println::println!("Controller Board initialized!");
+    esp_println::println!("Controller Board initialized! ESP-NOW on channel 1, broadcast target {:02X?}", BROADCAST_ADDRESS);
 
     esp_println::println!("Configuring I2C0 at {} kHz on GPIO6(SDA)/GPIO7(SCL)", I2C_FREQUENCY_KHZ);
     let i2c_config = I2cConfig::default().with_frequency(Rate::from_khz(I2C_FREQUENCY_KHZ));
@@ -600,7 +601,8 @@ async fn main(_spawner: Spawner) -> ! {
         {
             Ok(Ok((address, frame))) => {
                 let state = decode_joystick_state(&frame);
-                let changed = last_sampled_state != Some(state);
+                let joystick_active = state.x != 128 || state.y != 128;
+                let changed = last_sampled_state != Some(state) || joystick_active;
                 consecutive_read_failures = 0;
 
                 if changed {
@@ -664,8 +666,16 @@ async fn main(_spawner: Spawner) -> ! {
             let button_mask = encode_buttons(&tx_state.buttons);
             let packet = ControlPacket::new(tx_seq, tx_state.x, tx_state.y, button_mask);
 
-            if let Err(e) = link.send_control(packet) {
-                esp_println::println!("ESP-NOW send error: {:?}", e);
+            match link.send_control(packet) {
+                Ok(()) => {
+                    esp_println::println!(
+                        "ESP-NOW sent #{} ({}) x={} y={} btn={:#04x}",
+                        tx_seq, reason, tx_state.x, tx_state.y, button_mask
+                    );
+                }
+                Err(e) => {
+                    esp_println::println!("ESP-NOW send error: {:?}", e);
+                }
             }
 
             if CONTROL_TX_LOGS_ENABLED {
