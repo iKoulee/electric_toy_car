@@ -48,5 +48,5 @@ pub fn set_rgb<const N: usize>(
     b: u8,
 ) -> Result<(), LedAdapterError> {
     // WS2812B expects GRB byte order; Grb<u8> ComponentSlice yields [g, r, b].
-    led.write([Grb { g, r, b }].into_iter())
+    led.write([Grb { g, r, b }])
 }

@@ -2,6 +2,7 @@
 #![no_main]
 
 mod esp_now_transport;
+mod motor;
 
 use common_comms::{
     LinkState,
@@ -15,7 +16,13 @@ use embassy_executor::Spawner;
 use embassy_time::Timer;
 use esp_backtrace as _;
 use esp_hal::{
+    gpio::{Level, Output, OutputConfig},
     interrupt::software::SoftwareInterruptControl,
+    ledc::{
+        channel::{self, ChannelIFace},
+        timer::{self, TimerIFace},
+        Ledc, LSGlobalClkSource, LowSpeed,
+    },
     rmt::Rmt,
     time::Rate,
     timer::timg::TimerGroup,
@@ -61,6 +68,39 @@ async fn main(_spawner: Spawner) -> ! {
         esp_println::println!("Failed to set vehicle boot LED color: {:?}", error);
     }
 
+    // Motor init: LEDC hardware PWM for IBT-2 (RPWM=GPIO2, LPWM=GPIO3, R_EN=GPIO4, L_EN=GPIO5)
+    esp_println::println!("init[7]: LEDC + IBT-2 motor");
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+    let mut pwm_timer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    pwm_timer
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty8Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_khz(20),
+        })
+        .expect("LEDC timer config failed");
+
+    let mut rpwm = ledc.channel::<LowSpeed>(channel::Number::Channel0, peripherals.GPIO2);
+    rpwm.configure(channel::config::Config {
+        timer: &pwm_timer,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .expect("RPWM channel config failed");
+
+    let mut lpwm = ledc.channel::<LowSpeed>(channel::Number::Channel1, peripherals.GPIO3);
+    lpwm.configure(channel::config::Config {
+        timer: &pwm_timer,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .expect("LPWM channel config failed");
+
+    let r_en = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
+    let l_en = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+    let mut motor = motor::Ibt2Motor::new(rpwm, lpwm, r_en, l_en);
+
     esp_println::println!("Main Vehicle Board initialized! ESP-NOW on channel 1");
 
     let transport = esp_now_transport::Esp32C6EspNow::new(esp_now);
@@ -89,6 +129,8 @@ async fn main(_spawner: Spawner) -> ! {
                     "[tick {}] ESP-NOW received seq={} x={} y={} btn={:#04x} rssi={:?}",
                     tick, seq, px, py, pbtn, received.meta.rssi_dbm
                 );
+                motor.set_drive(received.packet.y);
+
                 let btns = received.packet.buttons;
                 let tracked = ControlPacket::BUTTON_A | ControlPacket::BUTTON_B
                     | ControlPacket::BUTTON_C | ControlPacket::BUTTON_D;
@@ -118,6 +160,7 @@ async fn main(_spawner: Spawner) -> ! {
                 }
                 LinkState::Alive => {
                     esp_println::println!("Vehicle link state: alive");
+                    motor.enable();
                     for _ in 0..2 {
                         let _ = common_led::set_rgb(&mut led, 0, 0, 16);
                         Timer::after_millis(200).await;
@@ -128,7 +171,7 @@ async fn main(_spawner: Spawner) -> ! {
                 LinkState::TimedOut => {
                     esp_println::println!("Vehicle link state: timed out, entering fail-safe stop");
                     vehicle_link.reset_sequence();
-                    // TODO(next): Immediately command H-bridge stop state here.
+                    motor.stop();
                 }
             }
             last_state = state;
