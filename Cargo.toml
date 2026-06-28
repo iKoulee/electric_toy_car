@@ -2,6 +2,7 @@
 members = [
     "common_comms",
     "common_led",
+    "common_host_proto",
     "controller",
     "vehicle"
 ]
