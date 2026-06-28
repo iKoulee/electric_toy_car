@@ -3,9 +3,11 @@
 
 mod esp_now_transport;
 mod joystick;
+mod usb_link;
 
 use common_comms::espnow::ControllerLink;
 use common_comms::protocol::{CONTROL_TX_INTERVAL_MS, ControlPacket};
+use common_host_proto::{BoardToHost, HostToBoard};
 use embassy_executor::Spawner;
 use embassy_time::{Duration as EmbassyDuration, TimeoutError, Timer, with_timeout};
 use esp_backtrace as _;
@@ -16,6 +18,7 @@ use esp_hal::{
     rmt::Rmt,
     timer::timg::TimerGroup,
     time::Rate,
+    usb_serial_jtag::UsbSerialJtag,
 };
 use esp_radio::esp_now::BROADCAST_ADDRESS;
 
@@ -50,10 +53,13 @@ const JOYSTICK_PRINT_ON_CHANGE_ONLY: bool = true;
 const CONTROL_TX_LOGS_ENABLED: bool = false;
 
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
+
+    let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
+    spawner.spawn(usb_link::task(usb)).expect("usb_link task spawn failed");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -144,6 +150,8 @@ async fn main(_spawner: Spawner) -> ! {
     let mut ticks_since_tx: u64 = CONTROL_TX_INTERVAL_MS;
     let mut consecutive_read_failures: u8 = 0;
     let mut ticks_since_status_log: u64 = JOYSTICK_STATUS_LOG_INTERVAL_MS;
+    // LED override from USB host: None = automatic state-driven color.
+    let mut led_override: Option<[u8; 3]> = None;
 
     loop {
         // Cooperative control scheduling: fast sampling + event-driven TX + periodic keepalive.
@@ -165,6 +173,12 @@ async fn main(_spawner: Spawner) -> ! {
                 if changed {
                     tx_reason = Some("change");
                     tx_state = state;
+                    let button_mask = encode_buttons(&state.buttons);
+                    let _ = usb_link::EVENTS.try_send(BoardToHost::JoystickState {
+                        x: state.x,
+                        y: state.y,
+                        buttons: button_mask,
+                    });
                 }
 
                 if JOYSTICK_SAMPLE_LOGS_ENABLED && (!JOYSTICK_PRINT_ON_CHANGE_ONLY || changed) {
@@ -249,7 +263,24 @@ async fn main(_spawner: Spawner) -> ! {
             ticks_since_tx = 0;
         }
 
-        let color = if led_toggle { (0, 0, 16) } else { (16, 0, 0) };
+        // Process USB host commands.
+        while let Ok(cmd) = usb_link::CMDS.try_receive() {
+            match cmd {
+                HostToBoard::SetLed(color) => {
+                    led_override = color;
+                    let _ = usb_link::EVENTS.try_send(BoardToHost::LedAck);
+                }
+                _ => {}
+            }
+        }
+
+        let color = if let Some([r, g, b]) = led_override {
+            (r, g, b)
+        } else if led_toggle {
+            (0, 0, 16)
+        } else {
+            (16, 0, 0)
+        };
         led_toggle = !led_toggle;
 
         if let Err(error) = common_led::set_rgb(&mut led, color.0, color.1, color.2) {

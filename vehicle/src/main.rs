@@ -3,6 +3,7 @@
 
 mod esp_now_transport;
 mod motor;
+mod usb_link;
 
 use common_comms::{
     LinkState,
@@ -12,6 +13,7 @@ use common_comms::{
 };
 use common_comms::espnow::{LinkError, VehicleLink};
 use common_comms::protocol::ControlPacket;
+use common_host_proto::{BoardToHost, HostToBoard, LinkStateKind};
 use embassy_executor::Spawner;
 use embassy_time::Timer;
 use esp_backtrace as _;
@@ -26,6 +28,7 @@ use esp_hal::{
     rmt::Rmt,
     time::Rate,
     timer::timg::TimerGroup,
+    usb_serial_jtag::UsbSerialJtag,
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -33,10 +36,13 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const VEHICLE_LOOP_INTERVAL_MS: u64 = 50;
 
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
+
+    let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
+    spawner.spawn(usb_link::task(usb)).expect("usb_link task spawn failed");
 
     // Mirror controller init order exactly: radio/WiFi BEFORE any peripheral (RMT/LED) setup.
     esp_println::println!("init[1]: SoftwareInterruptControl + TimerGroup");
@@ -112,6 +118,7 @@ async fn main(_spawner: Spawner) -> ! {
     let mut last_state = LinkState::AwaitingFirstPacket;
     let mut last_button: u8 = 0;
     let mut tick: u64 = 0;
+    let mut led_override: Option<[u8; 3]> = None;
 
     loop {
         tick = tick.wrapping_add(1);
@@ -130,6 +137,14 @@ async fn main(_spawner: Spawner) -> ! {
                     tick, seq, px, py, pbtn, received.meta.rssi_dbm
                 );
                 motor.set_drive(received.packet.y);
+
+                let _ = usb_link::EVENTS.try_send(BoardToHost::ReceivedPacket {
+                    x: px,
+                    y: py,
+                    buttons: pbtn,
+                });
+                let duty = motor::y_to_duty(py);
+                let _ = usb_link::EVENTS.try_send(BoardToHost::MotorState { duty });
 
                 let btns = received.packet.buttons;
                 let tracked = ControlPacket::BUTTON_A | ControlPacket::BUTTON_B
@@ -154,9 +169,10 @@ async fn main(_spawner: Spawner) -> ! {
         let state = watchdog.state(elapsed_ms);
 
         if state != last_state {
-            match state {
+            let kind = match state {
                 LinkState::AwaitingFirstPacket => {
                     esp_println::println!("Vehicle link state: waiting for first control packet");
+                    LinkStateKind::AwaitingFirstPacket
                 }
                 LinkState::Alive => {
                     esp_println::println!("Vehicle link state: alive");
@@ -167,38 +183,56 @@ async fn main(_spawner: Spawner) -> ! {
                         let _ = common_led::set_rgb(&mut led, 0, 0, 0);
                         Timer::after_millis(200).await;
                     }
+                    LinkStateKind::Alive
                 }
                 LinkState::TimedOut => {
                     esp_println::println!("Vehicle link state: timed out, entering fail-safe stop");
                     vehicle_link.reset_sequence();
                     motor.stop();
+                    LinkStateKind::TimedOut
                 }
-            }
+            };
+            let _ = usb_link::EVENTS.try_send(BoardToHost::EspNowLinkState(kind));
             last_state = state;
         }
 
-        let color = match state {
-            LinkState::AwaitingFirstPacket => (16, 12, 0),
-            LinkState::Alive => {
-                if last_button & ControlPacket::BUTTON_A != 0 {
-                    (16, 12, 0)
-                } else if last_button & ControlPacket::BUTTON_B != 0 {
-                    (16, 16, 16)
-                } else if last_button & ControlPacket::BUTTON_C != 0 {
-                    (16, 0, 0)
-                } else if last_button & ControlPacket::BUTTON_D != 0 {
-                    (0, 0, 16)
-                } else {
-                    (0, 16, 0)
+        // Process USB host commands.
+        while let Ok(cmd) = usb_link::CMDS.try_receive() {
+            match cmd {
+                HostToBoard::SetLed(color) => {
+                    led_override = color;
+                    let _ = usb_link::EVENTS.try_send(BoardToHost::LedAck);
                 }
+                _ => {}
             }
-            LinkState::TimedOut => {
-                let blink = led_toggle;
-                led_toggle = !led_toggle;
-                if blink {
-                    (16, 0, 0)
-                } else {
-                    (2, 0, 0)
+        }
+
+        let color = if let Some([r, g, b]) = led_override {
+            (r, g, b)
+        } else {
+            match state {
+                LinkState::AwaitingFirstPacket => (16, 12, 0),
+                LinkState::Alive => {
+                    if last_button & ControlPacket::BUTTON_A != 0 {
+                        (16, 12, 0)
+                    } else if last_button & ControlPacket::BUTTON_B != 0 {
+                        (16, 16, 16)
+                    } else if last_button & ControlPacket::BUTTON_C != 0 {
+                        (16, 0, 0)
+                    } else if last_button & ControlPacket::BUTTON_D != 0 {
+                        (0, 0, 16)
+                    } else {
+                        (0, 16, 0)
+                    }
+                }
+                LinkState::TimedOut => {
+                    let blink = led_toggle;
+                    led_toggle = !led_toggle;
+                    if blink {
+                        (16, 0, 0)
+                    } else {
+                        (2, 0, 0)
+                    }
                 }
             }
         };

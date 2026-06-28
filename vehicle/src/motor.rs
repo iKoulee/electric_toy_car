@@ -55,3 +55,15 @@ impl<'d> Ibt2Motor<'d> {
         self.l_en.set_high();
     }
 }
+
+/// Convert joystick Y to a signed duty level (positive = forward, negative = reverse, 0 = coast).
+pub fn y_to_duty(y: u8) -> i16 {
+    let offset = (y as i16) - (CENTER as i16);
+    if offset.unsigned_abs() <= DEAD_ZONE as u16 {
+        0
+    } else if offset > 0 {
+        ((offset as u16 * 100) / (255 - CENTER as u16)).min(100) as i16
+    } else {
+        -((((-offset) as u16 * 100) / CENTER as u16).min(100) as i16)
+    }
+}
