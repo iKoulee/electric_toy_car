@@ -41,6 +41,16 @@ impl<'d> Ibt2Motor<'d> {
         }
     }
 
+    /// Electrodynamic brake: both half-bridges enabled, both PWM inputs at 0.
+    /// Both low-side FETs conduct, shorting the motor terminals to GND and
+    /// dissipating back-EMF as braking torque.
+    pub fn brake(&mut self) {
+        let _ = self.rpwm.set_duty(0);
+        let _ = self.lpwm.set_duty(0);
+        self.r_en.set_high();
+        self.l_en.set_high();
+    }
+
     /// Fail-safe: disable both half-bridges and zero PWM outputs.
     pub fn stop(&mut self) {
         let _ = self.rpwm.set_duty(0);
@@ -53,6 +63,30 @@ impl<'d> Ibt2Motor<'d> {
     pub fn enable(&mut self) {
         self.r_en.set_high();
         self.l_en.set_high();
+    }
+
+    pub fn set_r_en(&mut self, high: bool) {
+        if high { self.r_en.set_high() } else { self.r_en.set_low() }
+    }
+
+    pub fn set_l_en(&mut self, high: bool) {
+        if high { self.l_en.set_high() } else { self.l_en.set_low() }
+    }
+
+    /// Directly set PWM duty (-100–100).
+    /// Positive → RPWM active, LPWM=0. Negative → LPWM active, RPWM=0. Zero → coast.
+    pub fn set_pwm(&mut self, duty: i8) {
+        let pct = (duty.unsigned_abs()).min(100);
+        if duty > 0 {
+            let _ = self.lpwm.set_duty(0);
+            let _ = self.rpwm.set_duty(pct);
+        } else if duty < 0 {
+            let _ = self.rpwm.set_duty(0);
+            let _ = self.lpwm.set_duty(pct);
+        } else {
+            let _ = self.rpwm.set_duty(0);
+            let _ = self.lpwm.set_duty(0);
+        }
     }
 }
 

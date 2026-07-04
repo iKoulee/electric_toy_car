@@ -5,14 +5,9 @@ mod esp_now_transport;
 mod motor;
 mod usb_link;
 
-use common_comms::{
-    LinkState,
-    LinkWatchdog,
-    LINK_TIMEOUT_MS,
-    CONTROL_PACKET_LEN,
-};
 use common_comms::espnow::{LinkError, VehicleLink};
 use common_comms::protocol::ControlPacket;
+use common_comms::{LinkState, LinkWatchdog, CONTROL_PACKET_LEN, LINK_TIMEOUT_MS};
 use common_host_proto::{BoardToHost, HostToBoard, LinkStateKind};
 use embassy_executor::Spawner;
 use embassy_time::Timer;
@@ -23,7 +18,7 @@ use esp_hal::{
     ledc::{
         channel::{self, ChannelIFace},
         timer::{self, TimerIFace},
-        Ledc, LSGlobalClkSource, LowSpeed,
+        LSGlobalClkSource, Ledc, LowSpeed,
     },
     rmt::Rmt,
     time::Rate,
@@ -34,6 +29,7 @@ use esp_hal::{
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const VEHICLE_LOOP_INTERVAL_MS: u64 = 50;
+const VEHICLE_ESPNOW_LOGS_ENABLED: bool = false;
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -42,7 +38,9 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
-    spawner.spawn(usb_link::task(usb)).expect("usb_link task spawn failed");
+    spawner
+        .spawn(usb_link::task(usb))
+        .expect("usb_link task spawn failed");
 
     // Mirror controller init order exactly: radio/WiFi BEFORE any peripheral (RMT/LED) setup.
     esp_println::println!("init[1]: SoftwareInterruptControl + TimerGroup");
@@ -63,7 +61,9 @@ async fn main(spawner: Spawner) -> ! {
     wifi_ctrl.start().expect("WiFi start failed");
     esp_println::println!("init[6]: esp_now set_channel 1");
     let esp_now = interfaces.esp_now;
-    esp_now.set_channel(1).expect("Failed to set ESP-NOW channel");
+    esp_now
+        .set_channel(1)
+        .expect("Failed to set ESP-NOW channel");
 
     // LED init after WiFi, same as controller.
     let mut led_toggle = false;
@@ -83,7 +83,7 @@ async fn main(spawner: Spawner) -> ! {
         .configure(timer::config::Config {
             duty: timer::config::Duty::Duty8Bit,
             clock_source: timer::LSClockSource::APBClk,
-            frequency: Rate::from_khz(20),
+            frequency: Rate::from_hz(9765),
         })
         .expect("LEDC timer config failed");
 
@@ -132,11 +132,22 @@ async fn main(spawner: Spawner) -> ! {
                     received.packet.y,
                     received.packet.buttons,
                 );
-                esp_println::println!(
-                    "[tick {}] ESP-NOW received seq={} x={} y={} btn={:#04x} rssi={:?}",
-                    tick, seq, px, py, pbtn, received.meta.rssi_dbm
-                );
-                motor.set_drive(received.packet.y);
+                if VEHICLE_ESPNOW_LOGS_ENABLED {
+                    esp_println::println!(
+                        "[tick {}] ESP-NOW received seq={} x={} y={} btn={:#04x} rssi={:?}",
+                        tick,
+                        seq,
+                        px,
+                        py,
+                        pbtn,
+                        received.meta.rssi_dbm
+                    );
+                }
+                if received.packet.buttons & ControlPacket::BUTTON_C != 0 {
+                    motor.brake();
+                } else {
+                    motor.set_drive(received.packet.y);
+                }
 
                 let _ = usb_link::EVENTS.try_send(BoardToHost::ReceivedPacket {
                     x: px,
@@ -147,19 +158,26 @@ async fn main(spawner: Spawner) -> ! {
                 let _ = usb_link::EVENTS.try_send(BoardToHost::MotorState { duty });
 
                 let btns = received.packet.buttons;
-                let tracked = ControlPacket::BUTTON_A | ControlPacket::BUTTON_B
-                    | ControlPacket::BUTTON_C | ControlPacket::BUTTON_D;
+                let tracked = ControlPacket::BUTTON_A
+                    | ControlPacket::BUTTON_B
+                    | ControlPacket::BUTTON_C
+                    | ControlPacket::BUTTON_D;
                 if btns & tracked != 0 {
                     last_button = btns & tracked;
                 }
             }
             Ok(None) => {
-                if tick % 20 == 0 {
+                if VEHICLE_ESPNOW_LOGS_ENABLED && tick % 20 == 0 {
                     esp_println::println!("[tick {}] ESP-NOW: nothing received yet", tick);
                 }
             }
             Err(LinkError::StaleSequence) => {
-                esp_println::println!("[tick {}] ESP-NOW: stale/replayed sequence dropped", tick);
+                if VEHICLE_ESPNOW_LOGS_ENABLED {
+                    esp_println::println!(
+                        "[tick {}] ESP-NOW: stale/replayed sequence dropped",
+                        tick
+                    );
+                }
             }
             Err(e) => {
                 esp_println::println!("[tick {}] VehicleLink recv error: {:?}", tick, e);
@@ -202,6 +220,13 @@ async fn main(spawner: Spawner) -> ! {
                 HostToBoard::SetLed(color) => {
                     led_override = color;
                     let _ = usb_link::EVENTS.try_send(BoardToHost::LedAck);
+                }
+                HostToBoard::SetMotorEnable { r_en, l_en } => {
+                    motor.set_r_en(r_en);
+                    motor.set_l_en(l_en);
+                }
+                HostToBoard::SetMotorPwm { duty } => {
+                    motor.set_pwm(duty);
                 }
                 _ => {}
             }
