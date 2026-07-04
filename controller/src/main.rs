@@ -239,10 +239,12 @@ async fn main(spawner: Spawner) -> ! {
 
             match link.send_control(packet) {
                 Ok(()) => {
-                    esp_println::println!(
-                        "ESP-NOW sent #{} ({}) x={} y={} btn={:#04x}",
-                        tx_seq, reason, tx_state.x, tx_state.y, button_mask
-                    );
+                    if CONTROL_TX_LOGS_ENABLED {
+                        esp_println::println!(
+                            "ESP-NOW sent #{} ({}) x={} y={} btn={:#04x}",
+                            tx_seq, reason, tx_state.x, tx_state.y, button_mask
+                        );
+                    }
                 }
                 Err(e) => {
                     esp_println::println!("ESP-NOW send error: {:?}", e);
