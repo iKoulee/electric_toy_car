@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "host_tool"
+version = "0.1.0"
+edition = "2021"
+
+# Intentionally NOT a workspace member — the workspace targets riscv32imac (embedded).
+# Build and run from this directory: cargo run -- --port /dev/ttyACM0
+
+[dependencies]
+common_host_proto = { path = "../common_host_proto" }
+serialport = { version = "4", default-features = false }  # udev not needed — we open by explicit path
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.27"
+postcard = "1"
