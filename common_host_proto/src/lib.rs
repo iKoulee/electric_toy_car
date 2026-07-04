@@ -20,6 +20,11 @@ pub enum HostToBoard {
     Ping { version: u8 },
     /// Override the onboard LED. `None` restores automatic state-driven color.
     SetLed(Option<[u8; 3]>),
+    /// Vehicle only: directly set IBT-2 R_EN and L_EN enable pins.
+    SetMotorEnable { r_en: bool, l_en: bool },
+    /// Vehicle only: directly set IBT-2 PWM duty (-100–100).
+    /// Positive → RPWM active, LPWM=0. Negative → LPWM active, RPWM=0. Zero → both 0 (coast).
+    SetMotorPwm { duty: i8 },
 }
 
 /// Messages from board → host.
@@ -68,5 +73,17 @@ pub fn encode_board(msg: &BoardToHost, buf: &mut [u8]) -> Result<usize, postcard
 /// Decode a host→board COBS frame (must include the trailing 0x00).
 /// Decodes in-place; the slice is mutated during COBS removal.
 pub fn decode_host(frame: &mut [u8]) -> Result<HostToBoard, postcard::Error> {
+    postcard::from_bytes_cobs(frame)
+}
+
+/// Encode a host→board message into `buf` using COBS framing.
+/// Returns the number of bytes written (including the trailing 0x00).
+pub fn encode_host(msg: &HostToBoard, buf: &mut [u8]) -> Result<usize, postcard::Error> {
+    Ok(postcard::to_slice_cobs(msg, buf)?.len())
+}
+
+/// Decode a board→host COBS frame (must include the trailing 0x00).
+/// Decodes in-place; the slice is mutated during COBS removal.
+pub fn decode_board(frame: &mut [u8]) -> Result<BoardToHost, postcard::Error> {
     postcard::from_bytes_cobs(frame)
 }
