@@ -12,6 +12,20 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// Maximum encoded frame size including COBS overhead and 0x00 terminator.
 pub const MAX_FRAME_BYTES: usize = 64;
 
+/// Maximum length of a relayed (tunnelled) payload carried inside
+/// [`HostToBoard::ForPeer`] / [`BoardToHost::FromPeer`]. Sized well above the
+/// current message set while keeping a wrapped frame within [`MAX_FRAME_BYTES`].
+pub const RELAY_PAYLOAD_MAX: usize = 48;
+
+/// A relayed host-protocol message serialized as opaque bytes.
+///
+/// The bytes are a **non-COBS** postcard encoding of a [`HostToBoard`]
+/// (in `ForPeer`) or [`BoardToHost`] (in `FromPeer`) — COBS framing is only for
+/// the USB byte stream, so the tunnel carries the raw payload. Build/consume it
+/// with [`encode_host_payload`]/[`decode_host_payload`] and the `_board_`
+/// variants.
+pub type RelayPayload = heapless::Vec<u8, RELAY_PAYLOAD_MAX>;
+
 /// Messages from host → board.
 /// Boards return `Error::NotApplicable` for variants they don't support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +39,17 @@ pub enum HostToBoard {
     /// Vehicle only: directly set IBT-2 PWM duty (-100–100).
     /// Positive → RPWM active, LPWM=0. Negative → LPWM active, RPWM=0. Zero → both 0 (coast).
     SetMotorPwm { duty: i8 },
+    /// Relay an opaque host→board message to the paired peer board over the
+    /// ESP-NOW tunnel. The gateway forwards the bytes verbatim; the remote board
+    /// decodes them as a [`HostToBoard`] and executes it locally.
+    ForPeer(RelayPayload),
+    /// Enable or disable streaming this board's telemetry to the peer over the
+    /// tunnel. Off by default to save airtime and controller battery; typically
+    /// sent to the remote board wrapped in [`HostToBoard::ForPeer`].
+    EnableRemoteTelemetry { on: bool },
+    /// Forget the stored pairing and re-run the pairing handshake. Wrap in
+    /// [`HostToBoard::ForPeer`] to re-pair the remote board.
+    Repair,
 }
 
 /// Messages from board → host.
@@ -42,6 +67,13 @@ pub enum BoardToHost {
     MotorState { duty: i16 },
     LedAck,
     Error(HostError),
+    /// Telemetry relayed from the peer board through the gateway. `payload` is an
+    /// opaque non-COBS postcard [`BoardToHost`]; decode with
+    /// [`decode_board_payload`]. `source` identifies which board produced it.
+    FromPeer {
+        source: BoardKind,
+        payload: RelayPayload,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -88,4 +120,90 @@ pub fn encode_host(msg: &HostToBoard, buf: &mut [u8]) -> Result<usize, postcard:
 /// Decodes in-place; the slice is mutated during COBS removal.
 pub fn decode_board(frame: &mut [u8]) -> Result<BoardToHost, postcard::Error> {
     postcard::from_bytes_cobs(frame)
+}
+
+// ── Tunnel payload codecs (non-COBS) ────────────────────────────────────────
+//
+// The ESP-NOW tunnel carries the raw postcard bytes of a relayed message; COBS
+// framing belongs only to the USB byte stream. These encode/decode the opaque
+// payload stored in `ForPeer` / `FromPeer`.
+
+/// Encode a host→board message as a raw (non-COBS) tunnel payload.
+pub fn encode_host_payload(msg: &HostToBoard, buf: &mut [u8]) -> Result<usize, postcard::Error> {
+    Ok(postcard::to_slice(msg, buf)?.len())
+}
+
+/// Decode a raw (non-COBS) host→board tunnel payload.
+pub fn decode_host_payload(bytes: &[u8]) -> Result<HostToBoard, postcard::Error> {
+    postcard::from_bytes(bytes)
+}
+
+/// Encode a board→host message as a raw (non-COBS) tunnel payload.
+pub fn encode_board_payload(msg: &BoardToHost, buf: &mut [u8]) -> Result<usize, postcard::Error> {
+    Ok(postcard::to_slice(msg, buf)?.len())
+}
+
+/// Decode a raw (non-COBS) board→host tunnel payload.
+pub fn decode_board_payload(bytes: &[u8]) -> Result<BoardToHost, postcard::Error> {
+    postcard::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn for_peer_wraps_and_fits_usb_frame() {
+        // Inner command the PC wants the remote board to run.
+        let inner = HostToBoard::SetMotorPwm { duty: 42 };
+        let mut inner_buf = [0u8; RELAY_PAYLOAD_MAX];
+        let n = encode_host_payload(&inner, &mut inner_buf).unwrap();
+        let payload = RelayPayload::from_slice(&inner_buf[..n]).unwrap();
+
+        // Wrap and COBS-encode for USB; must fit MAX_FRAME_BYTES.
+        let mut frame = [0u8; MAX_FRAME_BYTES];
+        let framed = encode_host(&HostToBoard::ForPeer(payload), &mut frame).unwrap();
+        assert!(framed <= MAX_FRAME_BYTES);
+
+        // Gateway decodes the wrapper, then the remote decodes the inner bytes.
+        match decode_host(&mut frame[..framed]).unwrap() {
+            HostToBoard::ForPeer(bytes) => {
+                assert!(matches!(
+                    decode_host_payload(&bytes).unwrap(),
+                    HostToBoard::SetMotorPwm { duty: 42 }
+                ));
+            }
+            other => panic!("expected ForPeer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_peer_roundtrip() {
+        let telemetry = BoardToHost::MotorState { duty: -123 };
+        let mut buf = [0u8; RELAY_PAYLOAD_MAX];
+        let n = encode_board_payload(&telemetry, &mut buf).unwrap();
+        let payload = RelayPayload::from_slice(&buf[..n]).unwrap();
+
+        let mut frame = [0u8; MAX_FRAME_BYTES];
+        let framed = encode_board(
+            &BoardToHost::FromPeer {
+                source: BoardKind::Vehicle,
+                payload,
+            },
+            &mut frame,
+        )
+        .unwrap();
+        assert!(framed <= MAX_FRAME_BYTES);
+
+        match decode_board(&mut frame[..framed]).unwrap() {
+            BoardToHost::FromPeer { source, payload } => {
+                assert_eq!(source, BoardKind::Vehicle);
+                assert!(matches!(
+                    decode_board_payload(&payload).unwrap(),
+                    BoardToHost::MotorState { duty: -123 }
+                ));
+            }
+            other => panic!("expected FromPeer, got {other:?}"),
+        }
+    }
 }

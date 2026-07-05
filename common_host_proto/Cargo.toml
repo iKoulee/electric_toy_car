@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false }
+# Matches the heapless version postcard 1.x uses, so the two agree on the wire.
+heapless = { version = "0.8", default-features = false, features = ["serde"] }

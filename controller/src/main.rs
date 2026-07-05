@@ -3,16 +3,22 @@
 
 mod esp_now_transport;
 mod joystick;
+mod pairing;
 mod usb_link;
 
-use common_comms::espnow::ControllerLink;
+use common_comms::espnow::{BROADCAST_ADDRESS, EspNowLink, Inbound};
+use common_comms::frame::MAX_ENCODED_FRAME;
 use common_comms::protocol::{CONTROL_TX_INTERVAL_MS, ControlPacket};
-use common_host_proto::{BoardToHost, HostToBoard};
+use common_host_proto::{
+    decode_host_payload, encode_board_payload, BoardKind, BoardToHost, HostToBoard, RelayPayload,
+    RELAY_PAYLOAD_MAX,
+};
 use embassy_executor::Spawner;
 use embassy_time::{Duration as EmbassyDuration, TimeoutError, Timer, with_timeout};
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
+    gpio::{Input, InputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
     interrupt::software::SoftwareInterruptControl,
     rmt::Rmt,
@@ -20,7 +26,6 @@ use esp_hal::{
     time::Rate,
     usb_serial_jtag::UsbSerialJtag,
 };
-use esp_radio::esp_now::BROADCAST_ADDRESS;
 
 use joystick::{
     I2cScanSummary,
@@ -51,12 +56,73 @@ const JOYSTICK_STATUS_LOG_INTERVAL_MS: u64 = 250;
 const JOYSTICK_SAMPLE_LOGS_ENABLED: bool = false;
 const JOYSTICK_PRINT_ON_CHANGE_ONLY: bool = true;
 const CONTROL_TX_LOGS_ENABLED: bool = false;
+/// Max ESP-NOW frames drained per tick (pairing acks + tunnel frames).
+const MAX_RX_DRAIN_PER_TICK: usize = 8;
+
+/// The controller's concrete ESP-NOW link type.
+type ControllerEspLink<'r> = EspNowLink<esp_now_transport::Esp32C6EspNow<'r>>;
+/// The controller's pairing store (flash lives for the whole program).
+type ControllerPairingStore = pairing::PairingStore<'static>;
+
+/// Apply a host-protocol command, whether it arrived over USB (`CMDS`) or over
+/// the ESP-NOW tunnel (`TunnelCmd`). Both paths are handled identically.
+fn apply_local_cmd(
+    cmd: HostToBoard,
+    led_override: &mut Option<[u8; 3]>,
+    stream_to_peer: &mut bool,
+    link: &mut ControllerEspLink<'_>,
+    store: &mut Option<ControllerPairingStore>,
+) {
+    match cmd {
+        HostToBoard::SetLed(color) => {
+            *led_override = color;
+            let _ = usb_link::EVENTS.try_send(BoardToHost::LedAck);
+        }
+        HostToBoard::EnableRemoteTelemetry { on } => *stream_to_peer = on,
+        HostToBoard::Repair => {
+            if let Some(st) = store.as_mut() {
+                st.clear();
+            }
+            link.reset_pairing();
+        }
+        HostToBoard::ForPeer(payload) => {
+            let _ = link.send_tunnel_cmd(&payload);
+        }
+        _ => {}
+    }
+}
+
+/// Emit telemetry to the USB host, and — when remote-telemetry streaming is on
+/// and a peer is paired — also mirror it over the tunnel to the gateway.
+fn emit_telemetry(link: &mut ControllerEspLink<'_>, stream_to_peer: bool, event: BoardToHost) {
+    if stream_to_peer && link.is_paired() {
+        let mut buf = [0u8; RELAY_PAYLOAD_MAX];
+        if let Ok(n) = encode_board_payload(&event, &mut buf) {
+            let _ = link.send_tunnel_evt(&buf[..n]);
+        }
+    }
+    let _ = usb_link::EVENTS.try_send(event);
+}
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
+
+    // Pairing persistence + re-pair gesture: hold BOOT (GPIO9) low during reset
+    // to clear the stored pairing and force a fresh handshake; otherwise load the
+    // paired vehicle MAC so control comes up in unicast immediately.
+    let boot_btn = Input::new(peripherals.GPIO9, InputConfig::default().with_pull(Pull::Up));
+    let repair_requested = boot_btn.is_low();
+    let mut pairing_store: Option<ControllerPairingStore> =
+        pairing::PairingStore::new(peripherals.FLASH);
+    if repair_requested {
+        if let Some(store) = pairing_store.as_mut() {
+            store.clear();
+        }
+    }
+    let stored_peer = pairing_store.as_mut().and_then(|s| s.load());
 
     let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
     spawner.spawn(usb_link::task(usb)).expect("usb_link task spawn failed");
@@ -141,7 +207,10 @@ async fn main(spawner: Spawner) -> ! {
     let mut i2c = i2c.into_async();
 
     let transport = esp_now_transport::Esp32C6EspNow::new(esp_now);
-    let mut link = ControllerLink::new(transport, BROADCAST_ADDRESS);
+    let mut link = EspNowLink::new(transport);
+    if let Some(mac) = stored_peer {
+        let _ = link.learn_peer(mac);
+    }
 
     let mut tx_seq: u16 = 0;
     let mut last_sampled_state = None;
@@ -152,8 +221,60 @@ async fn main(spawner: Spawner) -> ! {
     let mut ticks_since_status_log: u64 = JOYSTICK_STATUS_LOG_INTERVAL_MS;
     // LED override from USB host: None = automatic state-driven color.
     let mut led_override: Option<[u8; 3]> = None;
+    // Whether this board mirrors its telemetry to the peer over the tunnel.
+    let mut stream_to_peer = false;
+    let mut rx_buf = [0u8; MAX_ENCODED_FRAME];
 
     loop {
+        // --- ESP-NOW receive drain (pairing acks + tunnel; controller ignores
+        //     inbound control frames) ---
+        for _ in 0..MAX_RX_DRAIN_PER_TICK {
+            match link.try_receive(&mut rx_buf) {
+                Ok(Some(Inbound::PairAck { peer })) => {
+                    // The vehicle acknowledged pairing: learn + persist its MAC
+                    // and switch control transmission to unicast. Ignore once
+                    // paired so a foreign board cannot hijack the pairing.
+                    if !link.is_paired() && link.learn_peer(peer).is_ok() {
+                        if let Some(st) = pairing_store.as_mut() {
+                            st.save(peer);
+                        }
+                    }
+                }
+                Ok(Some(Inbound::TunnelCmd { bytes, peer })) => {
+                    if link.paired_peer() != Some(peer) {
+                        continue;
+                    }
+                    let mut tmp = [0u8; RELAY_PAYLOAD_MAX];
+                    let n = bytes.len().min(tmp.len());
+                    tmp[..n].copy_from_slice(&bytes[..n]);
+                    if let Ok(cmd) = decode_host_payload(&tmp[..n]) {
+                        apply_local_cmd(
+                            cmd,
+                            &mut led_override,
+                            &mut stream_to_peer,
+                            &mut link,
+                            &mut pairing_store,
+                        );
+                    }
+                }
+                Ok(Some(Inbound::TunnelEvt { bytes, peer })) => {
+                    // Acting as gateway: forward the paired peer's telemetry to USB.
+                    if link.paired_peer() != Some(peer) {
+                        continue;
+                    }
+                    if let Ok(payload) = RelayPayload::from_slice(bytes) {
+                        let _ = usb_link::EVENTS.try_send(BoardToHost::FromPeer {
+                            source: BoardKind::Vehicle,
+                            payload,
+                        });
+                    }
+                }
+                Ok(Some(Inbound::Control(_))) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+
         // Cooperative control scheduling: fast sampling + event-driven TX + periodic keepalive.
         let mut tx_reason: Option<&str> = None;
         let mut tx_state = last_transmitted_state.unwrap_or_else(neutral_joystick_state);
@@ -174,11 +295,15 @@ async fn main(spawner: Spawner) -> ! {
                     tx_reason = Some("change");
                     tx_state = state;
                     let button_mask = encode_buttons(&state.buttons);
-                    let _ = usb_link::EVENTS.try_send(BoardToHost::JoystickState {
-                        x: state.x,
-                        y: state.y,
-                        buttons: button_mask,
-                    });
+                    emit_telemetry(
+                        &mut link,
+                        stream_to_peer,
+                        BoardToHost::JoystickState {
+                            x: state.x,
+                            y: state.y,
+                            buttons: button_mask,
+                        },
+                    );
                 }
 
                 if JOYSTICK_SAMPLE_LOGS_ENABLED && (!JOYSTICK_PRINT_ON_CHANGE_ONLY || changed) {
@@ -267,13 +392,13 @@ async fn main(spawner: Spawner) -> ! {
 
         // Process USB host commands.
         while let Ok(cmd) = usb_link::CMDS.try_receive() {
-            match cmd {
-                HostToBoard::SetLed(color) => {
-                    led_override = color;
-                    let _ = usb_link::EVENTS.try_send(BoardToHost::LedAck);
-                }
-                _ => {}
-            }
+            apply_local_cmd(
+                cmd,
+                &mut led_override,
+                &mut stream_to_peer,
+                &mut link,
+                &mut pairing_store,
+            );
         }
 
         let color = if let Some([r, g, b]) = led_override {

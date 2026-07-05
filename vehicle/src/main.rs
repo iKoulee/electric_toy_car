@@ -3,18 +3,23 @@
 
 mod esp_now_transport;
 mod motor;
+mod pairing;
 mod usb_link;
 
-use common_comms::espnow::{LinkError, VehicleLink};
+use common_comms::espnow::{EspNowLink, Inbound, BROADCAST_ADDRESS};
+use common_comms::frame::MAX_ENCODED_FRAME;
 use common_comms::protocol::ControlPacket;
-use common_comms::{LinkState, LinkWatchdog, CONTROL_PACKET_LEN, LINK_TIMEOUT_MS};
-use common_host_proto::{BoardToHost, HostToBoard, LinkStateKind};
+use common_comms::{LinkState, LinkWatchdog, LINK_TIMEOUT_MS};
+use common_host_proto::{
+    decode_host_payload, encode_board_payload, BoardKind, BoardToHost, HostToBoard, LinkStateKind,
+    RelayPayload, RELAY_PAYLOAD_MAX,
+};
 use common_led::{LED_BUFFER_SIZE, LedPulseCode, Ws2812Led};
 use embassy_executor::Spawner;
 use embassy_time::Timer;
 use esp_backtrace as _;
 use esp_hal::{
-    gpio::{Level, Output, OutputConfig},
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     interrupt::software::SoftwareInterruptControl,
     ledc::{
         channel::{self, ChannelIFace},
@@ -30,6 +35,14 @@ use esp_hal::{
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const VEHICLE_LOOP_INTERVAL_MS: u64 = 50;
+/// Max ESP-NOW frames drained per tick, so a burst of control + tunnel frames
+/// does not starve either path (the radio RX queue is 10 deep).
+const MAX_RX_DRAIN_PER_TICK: usize = 8;
+
+/// The vehicle's concrete ESP-NOW link type.
+type VehicleEspLink<'r> = EspNowLink<esp_now_transport::Esp32C6EspNow<'r>>;
+/// The vehicle's pairing store (flash lives for the whole program).
+type VehiclePairingStore = pairing::PairingStore<'static>;
 
 // ── Pure-logic loop state ─────────────────────────────────────────────────────
 
@@ -40,6 +53,9 @@ struct VehicleRunState {
     tick: u64,
     led_toggle: bool,
     led_override: Option<[u8; 3]>,
+    /// When set, this board mirrors its telemetry to the peer over the tunnel
+    /// (it is acting as the remote board for a USB gateway).
+    stream_to_peer: bool,
 }
 
 impl VehicleRunState {
@@ -51,8 +67,57 @@ impl VehicleRunState {
             tick: 0,
             led_toggle: false,
             led_override: None,
+            stream_to_peer: false,
         }
     }
+}
+
+// ── Shared command / telemetry helpers ────────────────────────────────────────
+
+/// Apply a host-protocol command, whether it arrived over USB (`CMDS`) or over
+/// the ESP-NOW tunnel (`TunnelCmd`). Both paths are handled identically so a
+/// USB-gateway relay behaves exactly like a direct USB connection.
+fn apply_local_cmd(
+    cmd: HostToBoard,
+    motor: &mut motor::Ibt2Motor<'_>,
+    s: &mut VehicleRunState,
+    link: &mut VehicleEspLink<'_>,
+    store: &mut Option<VehiclePairingStore>,
+) {
+    match cmd {
+        HostToBoard::SetLed(color) => {
+            s.led_override = color;
+            let _ = usb_link::EVENTS.try_send(BoardToHost::LedAck);
+        }
+        HostToBoard::SetMotorEnable { r_en, l_en } => {
+            motor.set_r_en(r_en);
+            motor.set_l_en(l_en);
+        }
+        HostToBoard::SetMotorPwm { duty } => motor.set_pwm(duty),
+        HostToBoard::EnableRemoteTelemetry { on } => s.stream_to_peer = on,
+        HostToBoard::Repair => {
+            if let Some(st) = store.as_mut() {
+                st.clear();
+            }
+            link.reset_pairing();
+        }
+        HostToBoard::ForPeer(payload) => {
+            let _ = link.send_tunnel_cmd(&payload);
+        }
+        _ => {}
+    }
+}
+
+/// Emit telemetry to the USB host, and — when remote-telemetry streaming is on
+/// and a peer is paired — also mirror it over the tunnel to the gateway.
+fn emit_telemetry(link: &mut VehicleEspLink<'_>, s: &VehicleRunState, event: BoardToHost) {
+    if s.stream_to_peer && link.is_paired() {
+        let mut buf = [0u8; RELAY_PAYLOAD_MAX];
+        if let Ok(n) = encode_board_payload(&event, &mut buf) {
+            let _ = link.send_tunnel_evt(&buf[..n]);
+        }
+    }
+    let _ = usb_link::EVENTS.try_send(event);
 }
 
 // ── Composition root ──────────────────────────────────────────────────────────
@@ -62,6 +127,21 @@ async fn main(spawner: Spawner) -> ! {
     let p = esp_hal::init(esp_hal::Config::default());
 
     esp_alloc::heap_allocator!(size: 64 * 1024);
+
+    // ── Pairing persistence + re-pair gesture ─────────────────────────────────
+    //
+    // Hold BOOT (GPIO9) low during reset to clear the stored pairing and force a
+    // fresh handshake. Otherwise load the paired peer MAC so the link comes up
+    // in unicast immediately.
+    let boot_btn = Input::new(p.GPIO9, InputConfig::default().with_pull(Pull::Up));
+    let repair_requested = boot_btn.is_low();
+    let mut pairing_store: Option<VehiclePairingStore> = pairing::PairingStore::new(p.FLASH);
+    if repair_requested {
+        if let Some(store) = pairing_store.as_mut() {
+            store.clear();
+        }
+    }
+    let stored_peer = pairing_store.as_mut().and_then(|s| s.load());
 
     // Embassy runtime must start before any radio/WiFi/ESP-NOW initialisation.
     let sw_int = SoftwareInterruptControl::new(p.SW_INTERRUPT);
@@ -133,14 +213,14 @@ async fn main(spawner: Spawner) -> ! {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
 
-    run(link, motor, led, rx_buf).await
+    run(link, motor, led, rx_buf, pairing_store, stored_peer).await
 }
 
 // ── Hardware setup (runtime · transport · LED) ────────────────────────────────
 //
-// Configures the Embassy runtime, wraps ESP-NOW in the vehicle transport, and
-// initialises the WS2812B LED.  All radio/WiFi objects are anchored in main()
-// because EspNow borrows from esp_radio_ctrl for its lifetime.
+// Wraps ESP-NOW in the vehicle link and initialises the WS2812B LED. All
+// radio/WiFi objects are anchored in main() because EspNow borrows from
+// esp_radio_ctrl for its lifetime.
 
 async fn setup<'radio, 'led>(
     esp_now: esp_radio::esp_now::EspNow<'radio>,
@@ -148,16 +228,16 @@ async fn setup<'radio, 'led>(
     gpio8: esp_hal::peripherals::GPIO8<'static>,
     led_buf: &'led mut [LedPulseCode; LED_BUFFER_SIZE],
 ) -> (
-    VehicleLink<esp_now_transport::Esp32C6EspNow<'radio>>,
+    VehicleEspLink<'radio>,
     Ws2812Led<'led, { LED_BUFFER_SIZE }>,
-    [u8; CONTROL_PACKET_LEN],
+    [u8; MAX_ENCODED_FRAME],
 ) {
     esp_now
         .set_channel(1)
         .expect("Failed to set ESP-NOW channel");
     let transport = esp_now_transport::Esp32C6EspNow::new(esp_now);
-    let link = VehicleLink::new(transport);
-    let rx_buf = [0u8; CONTROL_PACKET_LEN];
+    let link = EspNowLink::new(transport);
+    let rx_buf = [0u8; MAX_ENCODED_FRAME];
 
     let rmt = Rmt::new(rmt, Rate::from_mhz(80)).expect("Failed to initialize RMT");
     let mut led = common_led::new_ws2812(rmt.channel0, gpio8, led_buf);
@@ -169,47 +249,107 @@ async fn setup<'radio, 'led>(
 // ── Main control loop ─────────────────────────────────────────────────────────
 
 async fn run<'radio, 'd, 'led>(
-    mut link: VehicleLink<esp_now_transport::Esp32C6EspNow<'radio>>,
+    mut link: VehicleEspLink<'radio>,
     mut motor: motor::Ibt2Motor<'d>,
     mut led: Ws2812Led<'led, { LED_BUFFER_SIZE }>,
-    mut rx_buf: [u8; CONTROL_PACKET_LEN],
+    mut rx_buf: [u8; MAX_ENCODED_FRAME],
+    mut store: Option<VehiclePairingStore>,
+    stored_peer: Option<[u8; 6]>,
 ) -> ! {
     let mut watchdog = LinkWatchdog::new(LINK_TIMEOUT_MS);
     let mut s = VehicleRunState::new();
 
+    // Come up already paired when a peer MAC survived in flash.
+    if let Some(mac) = stored_peer {
+        let _ = link.learn_peer(mac);
+    }
+
     loop {
         s.tick = s.tick.wrapping_add(1);
 
-        // --- ESP-NOW receive + motor actuation ---
-        match link.try_receive_control(&mut rx_buf) {
-            Ok(Some(received)) => {
-                watchdog.record_valid_packet(s.elapsed_ms);
+        // --- ESP-NOW receive drain (control + tunnel + pairing) ---
+        for _ in 0..MAX_RX_DRAIN_PER_TICK {
+            match link.try_receive(&mut rx_buf) {
+                Ok(Some(Inbound::Control(received))) => {
+                    // Once paired, ignore control from any other device so a
+                    // second nearby car/controller cannot drive this vehicle.
+                    if let Some(peer) = link.paired_peer() {
+                        if received.meta.peer_mac != peer {
+                            continue;
+                        }
+                    }
+                    watchdog.record_valid_packet(s.elapsed_ms);
 
-                let duty: i16 = if received.packet.buttons & ControlPacket::BUTTON_C != 0 {
-                    motor.brake();
-                    0
-                } else {
-                    motor.set_drive(received.packet.y);
-                    motor::y_to_duty(received.packet.y)
-                };
-                let _ = usb_link::EVENTS.try_send(BoardToHost::ReceivedPacket {
-                    x: received.packet.x,
-                    y: received.packet.y,
-                    buttons: received.packet.buttons,
-                });
-                let _ = usb_link::EVENTS.try_send(BoardToHost::MotorState { duty });
+                    // Pairing bootstrap: learn + persist the controller MAC.
+                    if !link.is_paired() && link.learn_peer(received.meta.peer_mac).is_ok() {
+                        if let Some(st) = store.as_mut() {
+                            st.save(received.meta.peer_mac);
+                        }
+                    }
+                    // A broadcast control frame means the controller has not
+                    // learned us yet; acknowledge so it can switch to unicast.
+                    if received.meta.dst_mac == BROADCAST_ADDRESS {
+                        let _ = link.send_pair_ack();
+                    }
 
-                let tracked = ControlPacket::BUTTON_A
-                    | ControlPacket::BUTTON_B
-                    | ControlPacket::BUTTON_C
-                    | ControlPacket::BUTTON_D;
-                if received.packet.buttons & tracked != 0 {
-                    s.last_button = received.packet.buttons & tracked;
+                    let duty: i16 = if received.packet.buttons & ControlPacket::BUTTON_C != 0 {
+                        motor.brake();
+                        0
+                    } else {
+                        motor.set_drive(received.packet.y);
+                        motor::y_to_duty(received.packet.y)
+                    };
+                    emit_telemetry(
+                        &mut link,
+                        &s,
+                        BoardToHost::ReceivedPacket {
+                            x: received.packet.x,
+                            y: received.packet.y,
+                            buttons: received.packet.buttons,
+                        },
+                    );
+                    emit_telemetry(&mut link, &s, BoardToHost::MotorState { duty });
+
+                    let tracked = ControlPacket::BUTTON_A
+                        | ControlPacket::BUTTON_B
+                        | ControlPacket::BUTTON_C
+                        | ControlPacket::BUTTON_D;
+                    if received.packet.buttons & tracked != 0 {
+                        s.last_button = received.packet.buttons & tracked;
+                    }
                 }
+                Ok(Some(Inbound::TunnelCmd { bytes, peer })) => {
+                    // Only accept tunnelled commands from the paired peer.
+                    if link.paired_peer() != Some(peer) {
+                        continue;
+                    }
+                    // Copy out to release the rx buffer borrow before acting.
+                    let mut tmp = [0u8; RELAY_PAYLOAD_MAX];
+                    let n = bytes.len().min(tmp.len());
+                    tmp[..n].copy_from_slice(&bytes[..n]);
+                    if let Ok(cmd) = decode_host_payload(&tmp[..n]) {
+                        apply_local_cmd(cmd, &mut motor, &mut s, &mut link, &mut store);
+                    }
+                }
+                Ok(Some(Inbound::TunnelEvt { bytes, peer })) => {
+                    // Acting as gateway: forward the paired peer's telemetry to USB.
+                    if link.paired_peer() != Some(peer) {
+                        continue;
+                    }
+                    if let Ok(payload) = RelayPayload::from_slice(bytes) {
+                        let _ = usb_link::EVENTS.try_send(BoardToHost::FromPeer {
+                            source: BoardKind::Controller,
+                            payload,
+                        });
+                    }
+                }
+                Ok(Some(Inbound::PairAck { .. })) => {
+                    // The vehicle initiates pairing; a PairAck here is unexpected.
+                }
+                Ok(None) => break,
+                // Stale/parse errors: skip this frame and keep draining.
+                Err(_) => {}
             }
-            Ok(None) => {}
-            Err(LinkError::StaleSequence) => {}
-            Err(_) => {}
         }
 
         // --- Link state machine ---
@@ -236,26 +376,13 @@ async fn run<'radio, 'd, 'led>(
                     LinkStateKind::TimedOut
                 }
             };
-            let _ = usb_link::EVENTS.try_send(BoardToHost::EspNowLinkState(kind));
+            emit_telemetry(&mut link, &s, BoardToHost::EspNowLinkState(kind));
             s.last_state = link_state;
         }
 
         // --- USB command drain ---
         while let Ok(cmd) = usb_link::CMDS.try_receive() {
-            match cmd {
-                HostToBoard::SetLed(color) => {
-                    s.led_override = color;
-                    let _ = usb_link::EVENTS.try_send(BoardToHost::LedAck);
-                }
-                HostToBoard::SetMotorEnable { r_en, l_en } => {
-                    motor.set_r_en(r_en);
-                    motor.set_l_en(l_en);
-                }
-                HostToBoard::SetMotorPwm { duty } => {
-                    motor.set_pwm(duty);
-                }
-                _ => {}
-            }
+            apply_local_cmd(cmd, &mut motor, &mut s, &mut link, &mut store);
         }
 
         // --- LED colour ---

@@ -11,8 +11,8 @@ use postcard::accumulator::{CobsAccumulator, FeedResult};
 use serialport::SerialPort;
 
 use common_host_proto::{
-    encode_host, BoardToHost, HostToBoard, LinkStateKind, BoardKind,
-    MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    decode_board_payload, encode_host, encode_host_payload, BoardKind, BoardToHost, HostToBoard,
+    LinkStateKind, RelayPayload, MAX_FRAME_BYTES, PROTOCOL_VERSION, RELAY_PAYLOAD_MAX,
 };
 
 #[derive(Parser)]
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    print_info("Commands: ping | led R G B | led off | motor_en R_EN L_EN | motor_pwm DUTY (-100..100) | quit");
+    print_info("Commands: ping | led R G B | led off | motor_en R_EN L_EN | motor_pwm DUTY (-100..100) | remote_tele on|off | repair | peer <cmd> | quit");
 
     loop {
         // Drain all pending board messages.
@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(cmd) => send_host_msg(&write_port, &cmd, &debug)?,
                     None => {
                         print_error(&format!("Unknown command: {input}"));
-                        print_info("Commands: ping | led R G B | led off | motor_en R_EN L_EN | motor_pwm DUTY (-100..100) | quit");
+                        print_info("Commands: ping | led R G B | led off | motor_en R_EN L_EN | motor_pwm DUTY (-100..100) | remote_tele on|off | repair | peer <cmd> | quit");
                     }
                 },
             }
@@ -224,6 +224,17 @@ fn parse_command(input: &str) -> Option<HostToBoard> {
             let duty = d.parse::<i8>().ok()?.clamp(-100, 100);
             Some(HostToBoard::SetMotorPwm { duty })
         }
+        ["remote_tele", s] => Some(HostToBoard::EnableRemoteTelemetry { on: parse_bool(s)? }),
+        ["repair"] => Some(HostToBoard::Repair),
+        // Relay any other command to the peer board via the gateway: parse the
+        // remainder recursively and wrap its raw encoding in ForPeer.
+        ["peer", rest @ ..] if !rest.is_empty() => {
+            let inner = parse_command(&rest.join(" "))?;
+            let mut buf = [0u8; RELAY_PAYLOAD_MAX];
+            let n = encode_host_payload(&inner, &mut buf).ok()?;
+            let payload = RelayPayload::from_slice(&buf[..n]).ok()?;
+            Some(HostToBoard::ForPeer(payload))
+        }
         _ => None,
     }
 }
@@ -247,49 +258,59 @@ fn send_host_msg(
 }
 
 fn print_board_msg(msg: &BoardToHost) {
+    let (line, color) = board_msg_line(msg);
+    print_colored(&line, color);
+}
+
+fn board_kind_str(board: &BoardKind) -> &'static str {
+    match board {
+        BoardKind::Controller => "Controller",
+        BoardKind::Vehicle => "Vehicle",
+    }
+}
+
+/// Render a board message as a (text, colour) pair. Split out from
+/// `print_board_msg` so relayed `FromPeer` telemetry can wrap its inner
+/// message's rendering with a source-board prefix.
+fn board_msg_line(msg: &BoardToHost) -> (String, Color) {
     match msg {
-        BoardToHost::Pong { version, board } => {
-            let board_str = match board {
-                BoardKind::Controller => "Controller",
-                BoardKind::Vehicle => "Vehicle",
-            };
-            print_colored(
-                &format!("[PONG] version={version} board={board_str}"),
-                Color::Green,
-            );
-        }
-        BoardToHost::JoystickState { x, y, buttons } => {
-            print_colored(
-                &format!("[JOYSTICK] x={x} y={y} buttons={buttons:#04x}"),
-                Color::Cyan,
-            );
-        }
+        BoardToHost::Pong { version, board } => (
+            format!("[PONG] version={version} board={}", board_kind_str(board)),
+            Color::Green,
+        ),
+        BoardToHost::JoystickState { x, y, buttons } => (
+            format!("[JOYSTICK] x={x} y={y} buttons={buttons:#04x}"),
+            Color::Cyan,
+        ),
         BoardToHost::EspNowLinkState(state) => {
             let state_str = match state {
                 LinkStateKind::AwaitingFirstPacket => "AwaitingFirstPacket",
                 LinkStateKind::Alive => "Alive",
                 LinkStateKind::TimedOut => "TimedOut",
             };
-            print_colored(&format!("[LINK] {state_str}"), Color::Yellow);
+            (format!("[LINK] {state_str}"), Color::Yellow)
         }
-        BoardToHost::ReceivedPacket { x, y, buttons } => {
-            print_colored(
-                &format!("[PACKET] x={x} y={y} buttons={buttons:#04x}"),
-                Color::Cyan,
-            );
+        BoardToHost::ReceivedPacket { x, y, buttons } => (
+            format!("[PACKET] x={x} y={y} buttons={buttons:#04x}"),
+            Color::Cyan,
+        ),
+        BoardToHost::MotorState { duty } => (format!("[MOTOR] duty={duty}"), Color::Blue),
+        BoardToHost::LedAck => ("[LED_ACK]".to_string(), Color::Green),
+        BoardToHost::Error(e) => (format!("[ERROR] {e:?}"), Color::Red),
+        BoardToHost::FromPeer { source, payload } => {
+            let src = board_kind_str(source);
+            match decode_board_payload(payload) {
+                Ok(inner) => {
+                    let (line, color) = board_msg_line(&inner);
+                    (format!("[{src}] {line}"), color)
+                }
+                Err(_) => (
+                    format!("[{src}] <undecodable telemetry>"),
+                    Color::DarkGrey,
+                ),
+            }
         }
-        BoardToHost::MotorState { duty } => {
-            print_colored(&format!("[MOTOR] duty={duty}"), Color::Blue);
-        }
-        BoardToHost::LedAck => {
-            print_colored("[LED_ACK]", Color::Green);
-        }
-        BoardToHost::Error(e) => {
-            print_colored(&format!("[ERROR] {e:?}"), Color::Red);
-        }
-        _ => {
-            print_colored(&format!("[UNKNOWN] {msg:?}"), Color::DarkGrey);
-        }
+        _ => (format!("[UNKNOWN] {msg:?}"), Color::DarkGrey),
     }
 }
 
