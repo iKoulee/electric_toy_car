@@ -52,6 +52,7 @@ impl<'d> Ibt2Motor<'d> {
     }
 
     /// Fail-safe: disable both half-bridges and zero PWM outputs.
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         let _ = self.rpwm.set_duty(0);
         let _ = self.lpwm.set_duty(0);
@@ -75,6 +76,11 @@ impl<'d> Ibt2Motor<'d> {
 
     /// Directly set PWM duty (-100–100).
     /// Positive → RPWM active, LPWM=0. Negative → LPWM active, RPWM=0. Zero → coast.
+    ///
+    /// The IBT-2 uses BTS7960 half-bridge drivers with internal shoot-through protection
+    /// and matched propagation delays — software dead-time is not required.
+    /// The ordering "zero the inactive channel before activating the active channel" is
+    /// kept for consistency with `set_drive` and as a belt-and-suspenders measure.
     pub fn set_pwm(&mut self, duty: i8) {
         let pct = (duty.unsigned_abs()).min(100);
         if duty > 0 {
