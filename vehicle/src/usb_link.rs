@@ -60,11 +60,17 @@ fn handle_cmd(frame: &mut [u8]) -> Option<BoardToHost> {
         Ok(HostToBoard::Ping { version: _ }) => {
             Some(BoardToHost::Pong { version: PROTOCOL_VERSION, board: BoardKind::Vehicle })
         }
-        Ok(cmd @ HostToBoard::SetLed(_))
-        | Ok(cmd @ HostToBoard::SetMotorEnable { .. })
-        | Ok(cmd @ HostToBoard::SetMotorPwm { .. }) => {
+        Ok(cmd @ HostToBoard::SetLed(_)) => {
             let _ = CMDS.try_send(cmd);
             None
+        }
+        Ok(cmd @ HostToBoard::SetMotorEnable { .. })
+        | Ok(cmd @ HostToBoard::SetMotorPwm { .. }) => {
+            if CMDS.try_send(cmd).is_err() {
+                Some(BoardToHost::Error(HostError::Busy))
+            } else {
+                None
+            }
         }
         Ok(_) => Some(BoardToHost::Error(HostError::NotApplicable)),
         Err(_) => Some(BoardToHost::Error(HostError::ParseError)),

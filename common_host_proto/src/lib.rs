@@ -62,6 +62,8 @@ pub enum HostError {
     NotApplicable,
     FrameTooLarge,
     ParseError,
+    /// Command channel full; caller should retry.
+    Busy,
 }
 
 /// Encode a board→host message into `buf` using COBS framing.
