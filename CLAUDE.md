@@ -35,7 +35,7 @@ Target: `riscv32imac-unknown-none-elf` (ESP32-C6). The runner `espflash flash --
 | `common_comms` | Protocol, ESP-NOW transport trait, link watchdog — fully testable on host |
 | `common_led` | WS2812B LED helper via RMT (`set_rgb`) |
 | `controller` | Async firmware (Embassy + esp-rtos): joystick → TX |
-| `vehicle` | Sync firmware: RX → motor control (fail-safe supervised) |
+| `vehicle` | Async firmware (Embassy + esp-rtos): RX → motor control (fail-safe supervised) |
 
 ## Architecture
 
@@ -52,9 +52,10 @@ Target: `riscv32imac-unknown-none-elf` (ESP32-C6). The runner `espflash flash --
 - **TODO:** Wire up `ControllerLink` with the actual ESP-NOW peripheral
 
 ### Vehicle (`vehicle/src/main.rs`)
-- Synchronous with `esp_hal::main`; 50 ms tick loop
+- Async with `esp_rtos::main` and Embassy executor; 50 ms tick loop
+- `setup()` initialises radio/transport/LED; `run()` contains the main control loop
 - LED reflects link state: Yellow = awaiting, Green = alive, Red blink = timed out (fail-safe)
-- **TODO:** Poll `VehicleLink::try_receive_control()` each tick; implement PWM H-bridge; stop motors on `TimedOut`
+- On link timeout: `brake()` (H-bridges stay enabled) so USB `SetMotorPwm` commands take effect immediately — a host computer controlling the car over USB cable can override in this state
 
 ### Shared LED (`common_led`)
 - `new_ws2812(rmt_channel, gpio_pin, clocks)` → `SmartLedsAdapter`
@@ -63,7 +64,7 @@ Target: `riscv32imac-unknown-none-elf` (ESP32-C6). The runner `espflash flash --
 ## Embedded Constraints
 
 - **No `std`**, no heap allocation in hot paths, no blocking delays in control loops
-- Motor H-bridge PWM must include dead-time to prevent shoot-through
+- Motor H-bridge: the IBT-2 (BTS7960) includes internal shoot-through protection — software dead-time is not required; zero the inactive channel before activating the active channel as a belt-and-suspenders measure
 - All hardware bus errors (I2C, ESP-NOW) must be handled — never panic in production paths
 - RISC-V only — do not suggest Xtensa-specific features or assembly
-- Controller uses async (`embassy-executor`); vehicle uses sync — keep this split intentional
+- Both controller and vehicle use async (`embassy-executor` via `esp_rtos`)
