@@ -56,6 +56,11 @@ struct VehicleRunState {
     /// When set, this board mirrors its telemetry to the peer over the tunnel
     /// (it is acting as the remote board for a USB gateway).
     stream_to_peer: bool,
+    /// USB/tunnel manual motor override. While `Some`, the motor holds this duty
+    /// every tick — control packets and the link-timeout brake cannot stomp it.
+    /// Cleared automatically when the physical operator reclaims control by
+    /// moving the joystick out of its dead zone or pressing brake.
+    manual_pwm: Option<i8>,
 }
 
 impl VehicleRunState {
@@ -68,6 +73,7 @@ impl VehicleRunState {
             led_toggle: false,
             led_override: None,
             stream_to_peer: false,
+            manual_pwm: None,
         }
     }
 }
@@ -93,7 +99,13 @@ fn apply_local_cmd(
             motor.set_r_en(r_en);
             motor.set_l_en(l_en);
         }
-        HostToBoard::SetMotorPwm { duty } => motor.set_pwm(duty),
+        HostToBoard::SetMotorPwm { duty } => {
+            // Latch the manual override so it holds across control packets and
+            // link-state transitions, then apply it and report it immediately.
+            s.manual_pwm = Some(duty);
+            motor.set_pwm(duty);
+            emit_telemetry(link, s, BoardToHost::MotorState { duty: duty as i16 });
+        }
         HostToBoard::EnableRemoteTelemetry { on } => s.stream_to_peer = on,
         HostToBoard::Repair => {
             if let Some(st) = store.as_mut() {
@@ -292,9 +304,19 @@ async fn run<'radio, 'd, 'led>(
                         let _ = link.send_pair_ack();
                     }
 
-                    let duty: i16 = if received.packet.buttons & ControlPacket::BUTTON_C != 0 {
+                    // A physical operator (brake button, or joystick pushed out
+                    // of its dead zone) always reclaims control from a USB manual
+                    // override — safety takes precedence over remote control.
+                    let brake = received.packet.buttons & ControlPacket::BUTTON_C != 0;
+                    if brake || motor::y_to_duty(received.packet.y) != 0 {
+                        s.manual_pwm = None;
+                    }
+                    let duty: i16 = if brake {
                         motor.brake();
                         0
+                    } else if let Some(pwm) = s.manual_pwm {
+                        // USB manual override holds while the joystick is centred.
+                        pwm as i16
                     } else {
                         motor.set_drive(received.packet.y);
                         motor::y_to_duty(received.packet.y)
@@ -370,8 +392,9 @@ async fn run<'radio, 'd, 'led>(
                 LinkState::TimedOut => {
                     link.reset_sequence();
                     // brake() keeps H-bridges enabled so USB SetMotorPwm commands
-                    // take effect immediately while timed-out.  This is intentional
-                    // — a computer may take over direct motor control via USB cable.
+                    // take effect immediately while timed-out. A latched manual
+                    // override (`s.manual_pwm`) is re-asserted after this each tick,
+                    // so a computer keeps direct motor control via USB cable.
                     motor.brake();
                     LinkStateKind::TimedOut
                 }
@@ -383,6 +406,15 @@ async fn run<'radio, 'd, 'led>(
         // --- USB command drain ---
         while let Ok(cmd) = usb_link::CMDS.try_receive() {
             apply_local_cmd(cmd, &mut motor, &mut s, &mut link, &mut store);
+        }
+
+        // --- Hold manual PWM ---
+        // Re-assert the USB manual override every tick so control-packet handling
+        // and link-state transitions (notably the timeout brake) cannot leave it
+        // at zero. Runs regardless of link state, matching the documented intent
+        // that a USB host can drive the motor even while the RF link is down.
+        if let Some(pwm) = s.manual_pwm {
+            motor.set_pwm(pwm);
         }
 
         // --- LED colour ---

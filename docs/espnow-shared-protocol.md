@@ -134,4 +134,4 @@ frames.
 - `EspNowLink` (bidirectional) is wired into both boards via the board-specific
   `Esp32C6EspNow` transport adapter, including peer management.
 - Both `controller` and `vehicle` run the gateway/remote routing and flash-backed
-  pairing; `host_tool` exposes `peer <cmd>`, `remote_tele on|off`, and `repair`.
+  pairing; `pitwall` (host-side TUI dashboard) exposes `peer <cmd>`, `remote_tele on|off`, and `repair`.

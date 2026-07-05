@@ -1,0 +1,63 @@
+name: pitwall
+
+# Builds the host-side telemetry dashboard for Linux and Windows and uploads
+# the binaries as artifacts. `pitwall` is a standalone crate (not part of the
+# embedded workspace), so we build it with an explicit host target — this
+# overrides the repo's `.cargo/config.toml` which otherwise targets riscv32imac.
+# Stable toolchain is enough: the config's `[unstable]` table is ignored on stable.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pitwall/**"
+      - "common_host_proto/**"
+      - ".github/workflows/pitwall.yml"
+  pull_request:
+    paths:
+      - "pitwall/**"
+      - "common_host_proto/**"
+      - ".github/workflows/pitwall.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: pitwall
+            artifact: pitwall-linux
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: pitwall.exe
+            artifact: pitwall-windows
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: pitwall
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux needs the udev headers for serialport's build; we disable udev
+      # features in Cargo.toml, but libudev-sys may still be probed on some setups.
+      - name: Install Linux serial deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: pitwall/target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error

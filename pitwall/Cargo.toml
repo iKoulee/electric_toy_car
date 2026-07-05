@@ -1,16 +1,22 @@
 [workspace]
 
 [package]
-name = "host_tool"
+name = "pitwall"
 version = "0.1.0"
 edition = "2021"
 
 # Intentionally NOT a workspace member — the workspace targets riscv32imac (embedded).
 # Build and run from this directory: cargo run -- --port /dev/ttyACM0
+# On Windows, download the prebuilt pitwall.exe from CI, or build with an explicit
+# host target: cargo run --target x86_64-pc-windows-msvc
+
+[[bin]]
+name = "pitwall"
+path = "src/main.rs"
 
 [dependencies]
 common_host_proto = { path = "../common_host_proto" }
 serialport = { version = "4", default-features = false }  # udev not needed — we open by explicit path
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.27"
+ratatui = "0.29"  # crossterm is used via ratatui's re-export (ratatui::crossterm) to avoid version skew
 postcard = "1"

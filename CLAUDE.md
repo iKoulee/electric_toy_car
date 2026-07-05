@@ -58,12 +58,13 @@ Target: `riscv32imac-unknown-none-elf` (ESP32-C6). The runner `espflash flash --
 - `setup()` initialises radio/transport/LED; `run()` contains the main control loop
 - LED reflects link state: Yellow = awaiting, Green = alive, Red blink = timed out (fail-safe)
 - On link timeout: `brake()` (H-bridges stay enabled) so USB `SetMotorPwm` commands take effect immediately — a host computer controlling the car over USB cable can override in this state
+- USB/tunnel `SetMotorPwm` is a **latched manual override** (`VehicleRunState::manual_pwm`): re-asserted every tick so control packets and the timeout brake can't zero it. Cleared automatically when the physical operator reclaims control (joystick out of dead zone, or brake button) — safety wins over remote control
 
 ### USB-host gateway (both boards)
 - The board on USB acts as a **gateway**; the other is the **remote**. The PC controls/monitors both through one USB link — see `docs/espnow-shared-protocol.md`
 - `HostToBoard::ForPeer(bytes)` relays a raw host command to the remote over the tunnel; `BoardToHost::FromPeer { source, .. }` returns the remote's telemetry, source-tagged
 - Remote telemetry streaming is off by default; enable per-board with `EnableRemoteTelemetry { on }`. `Repair` (or BOOT/GPIO9 at reset) clears the stored pairing
-- `host_tool` commands: `peer <cmd>`, `remote_tele on|off`, `repair`
+- `pitwall` (host-side TUI dashboard, `pitwall/` — standalone crate outside the workspace) commands: `peer <cmd>`, `remote_tele on|off`, `repair`
 
 ### Shared LED (`common_led`)
 - `new_ws2812(rmt_channel, gpio_pin, clocks)` → `SmartLedsAdapter`
