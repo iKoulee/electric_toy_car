@@ -74,6 +74,10 @@ pub enum BoardToHost {
         source: BoardKind,
         payload: RelayPayload,
     },
+    /// Vehicle only: IBT-2 current-sense readings in milliamps.
+    /// `r_ma` = forward/right high-side (R_IS), `l_ma` = reverse/left (L_IS).
+    /// Only the active-direction channel reads non-zero.
+    CurrentSense { r_ma: u16, l_ma: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -205,5 +209,36 @@ mod tests {
             }
             other => panic!("expected FromPeer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn current_sense_roundtrip() {
+        let telemetry = BoardToHost::CurrentSense {
+            r_ma: 12_345,
+            l_ma: 0,
+        };
+
+        // Non-COBS tunnel payload round-trip.
+        let mut buf = [0u8; RELAY_PAYLOAD_MAX];
+        let n = encode_board_payload(&telemetry, &mut buf).unwrap();
+        assert!(matches!(
+            decode_board_payload(&buf[..n]).unwrap(),
+            BoardToHost::CurrentSense {
+                r_ma: 12_345,
+                l_ma: 0
+            }
+        ));
+
+        // COBS USB-frame round-trip; must fit MAX_FRAME_BYTES.
+        let mut usb = [0u8; MAX_FRAME_BYTES];
+        let framed = encode_board(&telemetry, &mut usb).unwrap();
+        assert!(framed <= MAX_FRAME_BYTES);
+        assert!(matches!(
+            decode_board(&mut usb[..framed]).unwrap(),
+            BoardToHost::CurrentSense {
+                r_ma: 12_345,
+                l_ma: 0
+            }
+        ));
     }
 }

@@ -93,6 +93,8 @@ fn render_board(
             Constraint::Length(1), // buttons
             Constraint::Length(1), // motor label + gauge
             Constraint::Min(1),    // motor sparkline
+            Constraint::Length(1), // current label
+            Constraint::Min(1),    // current sparkline
         ])
         .split(inner)
     } else {
@@ -144,6 +146,23 @@ fn render_board(
             &b.hist_duty,
             200,
             duty_color,
+            stale,
+            "no data — enable with: peer remote_tele on",
+        );
+
+        // IBT-2 current sense: forward loads R_IS, reverse loads L_IS.
+        let r_a = b.cur_r_ma.map(|ma| ma as f64 / 1000.0);
+        let l_a = b.cur_l_ma.map(|ma| ma as f64 / 1000.0);
+        frame.render_widget(
+            Paragraph::new(format!("Curr: R={}  L={}", fmt_amps(r_a), fmt_amps(l_a))),
+            rows[5],
+        );
+        render_spark(
+            frame,
+            rows[6],
+            &b.hist_current,
+            30_000, // mA — matches the ~28 A ADC ceiling
+            Color::Yellow,
             stale,
             "no data — enable with: peer remote_tele on",
         );
@@ -256,6 +275,10 @@ fn render_bar(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn fmt_opt(v: Option<u8>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
+}
+
+fn fmt_amps(v: Option<f64>) -> String {
+    v.map(|a| format!("{a:.2} A")).unwrap_or_else(|| "—".into())
 }
 
 #[cfg(test)]

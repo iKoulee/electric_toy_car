@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod current;
 mod esp_now_transport;
 mod motor;
 mod pairing;
@@ -217,6 +218,9 @@ async fn main(spawner: Spawner) -> ! {
     let l_en = Output::new(p.GPIO5, Level::High, OutputConfig::default());
     let motor = motor::Ibt2Motor::new(rpwm, lpwm, r_en, l_en);
 
+    // IBT-2 current sense: ADC1 on GPIO0 (R_IS) and GPIO1 (L_IS).
+    let current = current::CurrentSense::new(p.ADC1, p.GPIO0, p.GPIO1);
+
     let mut led_buf = common_led::ws2812_buffer!();
 
     // ── Transport + LED setup ─────────────────────────────────────────────────
@@ -225,7 +229,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
 
-    run(link, motor, led, rx_buf, pairing_store, stored_peer).await
+    run(link, motor, current, led, rx_buf, pairing_store, stored_peer).await
 }
 
 // ── Hardware setup (runtime · transport · LED) ────────────────────────────────
@@ -263,6 +267,7 @@ async fn setup<'radio, 'led>(
 async fn run<'radio, 'd, 'led>(
     mut link: VehicleEspLink<'radio>,
     mut motor: motor::Ibt2Motor<'d>,
+    mut current: current::CurrentSense<'d>,
     mut led: Ws2812Led<'led, { LED_BUFFER_SIZE }>,
     mut rx_buf: [u8; MAX_ENCODED_FRAME],
     mut store: Option<VehiclePairingStore>,
@@ -415,6 +420,15 @@ async fn run<'radio, 'd, 'led>(
         // that a USB host can drive the motor even while the RF link is down.
         if let Some(pwm) = s.manual_pwm {
             motor.set_pwm(pwm);
+        }
+
+        // --- Current sense ---
+        // Sample the IBT-2 IS pins every 4th tick (~200 ms) so the reading does
+        // not flood the 50 ms loop or the depth-8 USB event channel. Reuses the
+        // telemetry path, so it also mirrors over the tunnel when streaming.
+        if s.tick % 4 == 0 {
+            let (r_ma, l_ma) = current.read_ma().await;
+            emit_telemetry(&mut link, &s, BoardToHost::CurrentSense { r_ma, l_ma });
         }
 
         // --- LED colour ---

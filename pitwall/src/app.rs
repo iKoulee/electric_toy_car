@@ -34,11 +34,17 @@ pub struct BoardTelemetry {
     pub joy_y: Option<u8>,
     pub buttons: u8,
     pub motor_duty: Option<i16>,
+    /// IBT-2 current-sense readings in mA: `cur_r_ma` = forward/right high-side
+    /// (R_IS), `cur_l_ma` = reverse/left (L_IS). Only the active one is non-zero.
+    pub cur_r_ma: Option<u16>,
+    pub cur_l_ma: Option<u16>,
     pub last_seen: Option<Instant>,
     pub hist_x: VecDeque<u64>,
     pub hist_y: VecDeque<u64>,
     /// Motor duty shifted into 0..=200 (duty + 100) so a sparkline can show it.
     pub hist_duty: VecDeque<u64>,
+    /// Active current in mA (max of the two IS channels) for the sparkline.
+    pub hist_current: VecDeque<u64>,
 }
 
 impl BoardTelemetry {
@@ -164,6 +170,11 @@ impl AppState {
                 let shifted = (*duty as i64 + 100).clamp(0, 200) as u64;
                 BoardTelemetry::push_hist(&mut b.hist_duty, shifted);
             }
+            BoardToHost::CurrentSense { r_ma, l_ma } => {
+                b.cur_r_ma = Some(*r_ma);
+                b.cur_l_ma = Some(*l_ma);
+                BoardTelemetry::push_hist(&mut b.hist_current, (*r_ma).max(*l_ma) as u64);
+            }
             BoardToHost::EspNowLinkState(state) => b.link = Some(*state),
             _ => {}
         }
@@ -215,6 +226,10 @@ pub fn board_msg_line(msg: &BoardToHost) -> (String, Color) {
             Color::Cyan,
         ),
         BoardToHost::MotorState { duty } => (format!("[MOTOR] duty={duty}"), Color::Blue),
+        BoardToHost::CurrentSense { r_ma, l_ma } => (
+            format!("[CURRENT] R={r_ma} mA  L={l_ma} mA"),
+            Color::Yellow,
+        ),
         BoardToHost::LedAck => ("[LED_ACK]".to_string(), Color::Green),
         BoardToHost::Error(e) => (format!("[ERROR] {e:?}"), Color::Red),
         BoardToHost::FromPeer { source, payload } => {
