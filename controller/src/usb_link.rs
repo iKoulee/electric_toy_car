@@ -65,12 +65,8 @@ fn handle_cmd(frame: &mut [u8]) -> Option<BoardToHost> {
         Ok(HostToBoard::Ping { version: _ }) => {
             Some(BoardToHost::Pong { version: PROTOCOL_VERSION, board: BoardKind::Controller })
         }
-        Ok(cmd @ HostToBoard::SetLed(_)) => {
-            // Forward to main loop; ack will be sent after the main loop processes it.
-            let _ = CMDS.try_send(cmd);
-            None
-        }
-        Ok(cmd @ HostToBoard::ForPeer(_))
+        Ok(cmd @ HostToBoard::SetLed(_))
+        | Ok(cmd @ HostToBoard::ForPeer(_))
         | Ok(cmd @ HostToBoard::EnableRemoteTelemetry { .. })
         | Ok(cmd @ HostToBoard::Repair) => {
             // Forwarded to the main loop, which owns the radio and pairing store.

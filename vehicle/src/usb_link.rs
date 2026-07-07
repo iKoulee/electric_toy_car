@@ -65,11 +65,8 @@ fn handle_cmd(frame: &mut [u8]) -> Option<BoardToHost> {
         Ok(HostToBoard::Ping { version: _ }) => {
             Some(BoardToHost::Pong { version: PROTOCOL_VERSION, board: BoardKind::Vehicle })
         }
-        Ok(cmd @ HostToBoard::SetLed(_)) => {
-            let _ = CMDS.try_send(cmd);
-            None
-        }
-        Ok(cmd @ HostToBoard::SetMotorEnable { .. })
+        Ok(cmd @ HostToBoard::SetLed(_))
+        | Ok(cmd @ HostToBoard::SetMotorEnable { .. })
         | Ok(cmd @ HostToBoard::SetMotorPwm { .. })
         | Ok(cmd @ HostToBoard::ForPeer(_))
         | Ok(cmd @ HostToBoard::EnableRemoteTelemetry { .. })
