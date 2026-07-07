@@ -13,7 +13,7 @@ use crate::app::{
     board_kind_str, link_color, link_str, AppState, BoardTelemetry, BUTTONS, HELP,
 };
 
-pub fn draw(frame: &mut Frame, app: &AppState) {
+pub fn draw(frame: &mut Frame, app: &mut AppState) {
     let now = Instant::now();
     let root = Layout::vertical([
         Constraint::Percentage(52), // board panels
@@ -25,8 +25,8 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     let panels = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(root[0]);
 
-    render_board(frame, panels[0], "Controller", &app.controller, false, now);
-    render_board(frame, panels[1], "Vehicle", &app.vehicle, true, now);
+    render_board(frame, panels[0], "Controller", &mut app.controller, false, now);
+    render_board(frame, panels[1], "Vehicle", &mut app.vehicle, true, now);
     render_log(frame, root[1], app);
     render_bar(frame, root[2], app);
 
@@ -69,7 +69,7 @@ fn render_board(
     frame: &mut Frame,
     area: Rect,
     name: &str,
-    b: &BoardTelemetry,
+    b: &mut BoardTelemetry,
     is_vehicle: bool,
     now: Instant,
 ) {
@@ -143,7 +143,7 @@ fn render_board(
         render_spark(
             frame,
             rows[4],
-            &b.hist_duty,
+            &mut b.hist_duty,
             200,
             duty_color,
             stale,
@@ -160,7 +160,7 @@ fn render_board(
         render_spark(
             frame,
             rows[6],
-            &b.hist_current,
+            &mut b.hist_current,
             30_000, // mA — matches the ~28 A ADC ceiling
             Color::Yellow,
             stale,
@@ -172,12 +172,12 @@ fn render_board(
             Paragraph::new(format!("Joy X: {}", fmt_opt(b.joy_x))),
             rows[2],
         );
-        render_spark(frame, rows[3], &b.hist_x, 255, Color::Cyan, stale, "waiting…");
+        render_spark(frame, rows[3], &mut b.hist_x, 255, Color::Cyan, stale, "waiting…");
         frame.render_widget(
             Paragraph::new(format!("Joy Y: {}", fmt_opt(b.joy_y))),
             rows[4],
         );
-        render_spark(frame, rows[5], &b.hist_y, 255, Color::Cyan, stale, "waiting…");
+        render_spark(frame, rows[5], &mut b.hist_y, 255, Color::Cyan, stale, "waiting…");
     }
 }
 
@@ -185,7 +185,7 @@ fn render_board(
 fn render_spark(
     frame: &mut Frame,
     area: Rect,
-    hist: &std::collections::VecDeque<u64>,
+    hist: &mut std::collections::VecDeque<u64>,
     max: u64,
     color: Color,
     stale: bool,
@@ -197,10 +197,12 @@ fn render_spark(
         frame.render_widget(hint, area);
         return;
     }
-    let data: Vec<u64> = hist.iter().copied().collect();
+    // `make_contiguous` rearranges the ring buffer in place and hands back a
+    // `&[u64]` — no per-frame heap allocation, unlike collecting into a `Vec`.
+    let data: &[u64] = hist.make_contiguous();
     let color = if stale { Color::DarkGray } else { color };
     let spark = Sparkline::default()
-        .data(&data)
+        .data(data)
         .max(max)
         .style(Style::default().fg(color));
     frame.render_widget(spark, area);
@@ -301,7 +303,7 @@ mod tests {
         app.input = "motor_pwm 40".into();
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let text = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(text.contains("Controller"));
@@ -310,7 +312,7 @@ mod tests {
 
         // Help popup renders without panicking and shows the tunnel tip.
         app.show_help = true;
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let help = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(help.contains("Help"));
         assert!(help.contains("remote_tele"));
