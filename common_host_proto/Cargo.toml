@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false }
+# Backs the fixed-capacity `RelayPayload` (`heapless::Vec`) used for tunneled peer
+# commands — no_std, no alloc.
+heapless = { version = "0.8", default-features = false, features = ["serde"] }

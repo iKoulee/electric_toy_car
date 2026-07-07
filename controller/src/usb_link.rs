@@ -5,7 +5,7 @@ use common_host_proto::{
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embedded_io_async::Read;
+use embedded_io_async::{Read, Write};
 use esp_hal::{Async, usb_serial_jtag::UsbSerialJtag};
 
 /// Events from the main loop to the USB host (joystick readings, link state).
@@ -26,7 +26,11 @@ pub async fn task(usb: UsbSerialJtag<'static, Async>) {
             Either::First(msg) => {
                 let mut buf = [0u8; MAX_FRAME_BYTES];
                 if let Ok(n) = encode_board(&msg, &mut buf) {
-                    let _ = tx.write(&buf[..n]);
+                    // Async write: when no USB host is draining the FIFO this
+                    // yields (pends) instead of spin-waiting, so the Embassy
+                    // executor keeps running the main control loop.
+                    let _ = tx.write_all(&buf[..n]).await;
+                    let _ = tx.flush().await;
                 }
             }
             Either::Second(Ok(n)) => {
@@ -44,7 +48,8 @@ pub async fn task(usb: UsbSerialJtag<'static, Async>) {
                         if let Some(reply) = reply {
                             let mut buf = [0u8; MAX_FRAME_BYTES];
                             if let Ok(n) = encode_board(&reply, &mut buf) {
-                                let _ = tx.write(&buf[..n]);
+                                let _ = tx.write_all(&buf[..n]).await;
+                                let _ = tx.flush().await;
                             }
                         }
                     }
@@ -60,10 +65,16 @@ fn handle_cmd(frame: &mut [u8]) -> Option<BoardToHost> {
         Ok(HostToBoard::Ping { version: _ }) => {
             Some(BoardToHost::Pong { version: PROTOCOL_VERSION, board: BoardKind::Controller })
         }
-        Ok(cmd @ HostToBoard::SetLed(_)) => {
-            // Forward to main loop; ack will be sent after the main loop processes it.
-            let _ = CMDS.try_send(cmd);
-            None
+        Ok(cmd @ HostToBoard::SetLed(_))
+        | Ok(cmd @ HostToBoard::ForPeer(_))
+        | Ok(cmd @ HostToBoard::EnableRemoteTelemetry { .. })
+        | Ok(cmd @ HostToBoard::Repair) => {
+            // Forwarded to the main loop, which owns the radio and pairing store.
+            if CMDS.try_send(cmd).is_err() {
+                Some(BoardToHost::Error(HostError::Busy))
+            } else {
+                None
+            }
         }
         Ok(_) => Some(BoardToHost::Error(HostError::NotApplicable)),
         Err(_) => Some(BoardToHost::Error(HostError::ParseError)),
