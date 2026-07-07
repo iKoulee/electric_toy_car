@@ -48,11 +48,18 @@ cargo run
 cargo run -- --port /dev/ttyACM0
 ```
 
-On **Windows from source**, the repo's `.cargo/config.toml` forces the embedded
-Linux/riscv target, so pass an explicit host target:
+`pitwall/.cargo/config.toml` pins the Linux-host target `x86_64-unknown-linux-gnu`,
+so a bare `cargo run` works out of the box on Linux. On **Windows or macOS** that
+pinned Linux target is wrong for your host, so pass your own native target:
 
 ```powershell
+# Windows
 cargo run --target x86_64-pc-windows-msvc
+```
+
+```bash
+# macOS (Apple silicon)
+cargo run --target aarch64-apple-darwin
 ```
 
 > Stable Rust is sufficient — the repo config's `[unstable]` options are ignored on
