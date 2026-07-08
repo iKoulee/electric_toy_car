@@ -150,11 +150,22 @@ fn render_board(
             "no data — enable with: peer remote_tele on",
         );
 
-        // IBT-2 current sense: forward loads R_IS, reverse loads L_IS.
+        // IBT-2 current sense (scale/mapping unverified — see ibt2.rs). Raw mV + duty
+        // appended for calibration when the CurrentSenseRaw diagnostics arrive.
         let r_a = b.cur_r_ma.map(|ma| ma as f64 / 1000.0);
         let l_a = b.cur_l_ma.map(|ma| ma as f64 / 1000.0);
+        let raw = match b.cur_raw {
+            Some((r_mv, l_mv, duty)) => {
+                format!("  [raw R={r_mv}mV L={l_mv}mV d={duty}]")
+            }
+            None => String::new(),
+        };
         frame.render_widget(
-            Paragraph::new(format!("Curr: R={}  L={}", fmt_amps(r_a), fmt_amps(l_a))),
+            Paragraph::new(format!(
+                "Curr: R={}  L={}{raw}",
+                fmt_amps(r_a),
+                fmt_amps(l_a)
+            )),
             rows[5],
         );
         render_spark(

@@ -38,6 +38,8 @@ pub struct BoardTelemetry {
     /// (R_IS), `cur_l_ma` = reverse/left (L_IS). Only the active one is non-zero.
     pub cur_r_ma: Option<u16>,
     pub cur_l_ma: Option<u16>,
+    /// Raw IBT-2 sense diagnostics (mV, mV, commanded duty) for calibration.
+    pub cur_raw: Option<(u16, u16, i16)>,
     pub last_seen: Option<Instant>,
     pub hist_x: VecDeque<u64>,
     pub hist_y: VecDeque<u64>,
@@ -175,6 +177,9 @@ impl AppState {
                 b.cur_l_ma = Some(*l_ma);
                 BoardTelemetry::push_hist(&mut b.hist_current, (*r_ma).max(*l_ma) as u64);
             }
+            BoardToHost::CurrentSenseRaw { r_mv, l_mv, duty } => {
+                b.cur_raw = Some((*r_mv, *l_mv, *duty));
+            }
             BoardToHost::EspNowLinkState(state) => b.link = Some(*state),
             _ => {}
         }
@@ -229,6 +234,10 @@ pub fn board_msg_line(msg: &BoardToHost) -> (String, Color) {
         BoardToHost::CurrentSense { r_ma, l_ma } => (
             format!("[CURRENT] R={r_ma} mA  L={l_ma} mA"),
             Color::Yellow,
+        ),
+        BoardToHost::CurrentSenseRaw { r_mv, l_mv, duty } => (
+            format!("[CURRENT_RAW] R={r_mv} mV  L={l_mv} mV  duty={duty}"),
+            Color::DarkGray,
         ),
         BoardToHost::LedAck => ("[LED_ACK]".to_string(), Color::Green),
         BoardToHost::Error(e) => (format!("[ERROR] {e:?}"), Color::Red),

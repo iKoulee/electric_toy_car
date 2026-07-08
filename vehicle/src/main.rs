@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 
-mod current;
+mod drive;
 mod esp_now_transport;
-mod motor;
+mod ibt2;
 mod pairing;
 mod usb_link;
+
+use ibt2::HBridge;
 
 use common_comms::espnow::{EspNowLink, Inbound, BROADCAST_ADDRESS};
 use common_comms::frame::MAX_ENCODED_FRAME;
@@ -62,6 +64,8 @@ struct VehicleRunState {
     /// Cleared automatically when the physical operator reclaims control by
     /// moving the joystick out of its dead zone or pressing brake.
     manual_pwm: Option<i8>,
+    /// Last duty commanded to the motor this tick, for `CurrentSenseRaw` telemetry.
+    last_duty: i16,
 }
 
 impl VehicleRunState {
@@ -75,6 +79,7 @@ impl VehicleRunState {
             led_override: None,
             stream_to_peer: false,
             manual_pwm: None,
+            last_duty: 0,
         }
     }
 }
@@ -86,7 +91,7 @@ impl VehicleRunState {
 /// USB-gateway relay behaves exactly like a direct USB connection.
 fn apply_local_cmd(
     cmd: HostToBoard,
-    motor: &mut motor::Ibt2Motor<'_>,
+    motor: &mut impl HBridge,
     s: &mut VehicleRunState,
     link: &mut VehicleEspLink<'_>,
     store: &mut Option<VehiclePairingStore>,
@@ -105,6 +110,7 @@ fn apply_local_cmd(
             // link-state transitions, then apply it and report it immediately.
             s.manual_pwm = Some(duty);
             motor.set_pwm(duty);
+            s.last_duty = duty as i16;
             emit_telemetry(link, s, BoardToHost::MotorState { duty: duty as i16 });
         }
         HostToBoard::EnableRemoteTelemetry { on } => s.stream_to_peer = on,
@@ -216,10 +222,12 @@ async fn main(spawner: Spawner) -> ! {
 
     let r_en = Output::new(p.GPIO4, Level::High, OutputConfig::default());
     let l_en = Output::new(p.GPIO5, Level::High, OutputConfig::default());
-    let motor = motor::Ibt2Motor::new(rpwm, lpwm, r_en, l_en);
+    // One IBT-2 driver owns motor control + current sense: ADC1 on GPIO0 (R_IS) and
+    // GPIO1 (L_IS).
+    let mut driver = ibt2::Ibt2::new(rpwm, lpwm, r_en, l_en, p.ADC1, p.GPIO0, p.GPIO1);
 
-    // IBT-2 current sense: ADC1 on GPIO0 (R_IS) and GPIO1 (L_IS).
-    let current = current::CurrentSense::new(p.ADC1, p.GPIO0, p.GPIO1);
+    // Capture the idle current-sense baseline before driving the motor.
+    driver.calibrate_offset().await;
 
     let mut led_buf = common_led::ws2812_buffer!();
 
@@ -229,7 +237,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
 
-    run(link, motor, current, led, rx_buf, pairing_store, stored_peer).await
+    run(link, driver, led, rx_buf, pairing_store, stored_peer).await
 }
 
 // ── Hardware setup (runtime · transport · LED) ────────────────────────────────
@@ -264,10 +272,9 @@ async fn setup<'radio, 'led>(
 
 // ── Main control loop ─────────────────────────────────────────────────────────
 
-async fn run<'radio, 'd, 'led>(
+async fn run<'radio, 'led, D: HBridge>(
     mut link: VehicleEspLink<'radio>,
-    mut motor: motor::Ibt2Motor<'d>,
-    mut current: current::CurrentSense<'d>,
+    mut motor: D,
     mut led: Ws2812Led<'led, { LED_BUFFER_SIZE }>,
     mut rx_buf: [u8; MAX_ENCODED_FRAME],
     mut store: Option<VehiclePairingStore>,
@@ -313,7 +320,7 @@ async fn run<'radio, 'd, 'led>(
                     // of its dead zone) always reclaims control from a USB manual
                     // override — safety takes precedence over remote control.
                     let brake = received.packet.buttons & ControlPacket::BUTTON_C != 0;
-                    if brake || motor::y_to_duty(received.packet.y) != 0 {
+                    if brake || drive::y_to_duty(received.packet.y) != 0 {
                         s.manual_pwm = None;
                     }
                     let duty: i16 = if brake {
@@ -323,9 +330,11 @@ async fn run<'radio, 'd, 'led>(
                         // USB manual override holds while the joystick is centred.
                         pwm as i16
                     } else {
-                        motor.set_drive(received.packet.y);
-                        motor::y_to_duty(received.packet.y)
+                        let duty = drive::y_to_duty(received.packet.y);
+                        motor.set_pwm(duty as i8);
+                        duty
                     };
+                    s.last_duty = duty;
                     emit_telemetry(
                         &mut link,
                         &s,
@@ -401,6 +410,7 @@ async fn run<'radio, 'd, 'led>(
                     // override (`s.manual_pwm`) is re-asserted after this each tick,
                     // so a computer keeps direct motor control via USB cable.
                     motor.brake();
+                    s.last_duty = 0;
                     LinkStateKind::TimedOut
                 }
             };
@@ -420,6 +430,7 @@ async fn run<'radio, 'd, 'led>(
         // that a USB host can drive the motor even while the RF link is down.
         if let Some(pwm) = s.manual_pwm {
             motor.set_pwm(pwm);
+            s.last_duty = pwm as i16;
         }
 
         // --- Current sense ---
@@ -427,8 +438,24 @@ async fn run<'radio, 'd, 'led>(
         // not flood the 50 ms loop or the depth-8 USB event channel. Reuses the
         // telemetry path, so it also mirrors over the tunnel when streaming.
         if s.tick % 4 == 0 {
-            let (r_ma, l_ma) = current.read_ma().await;
-            emit_telemetry(&mut link, &s, BoardToHost::CurrentSense { r_ma, l_ma });
+            let c = motor.read_current().await;
+            emit_telemetry(
+                &mut link,
+                &s,
+                BoardToHost::CurrentSense {
+                    r_ma: c.r_ma,
+                    l_ma: c.l_ma,
+                },
+            );
+            emit_telemetry(
+                &mut link,
+                &s,
+                BoardToHost::CurrentSenseRaw {
+                    r_mv: c.r_mv,
+                    l_mv: c.l_mv,
+                    duty: s.last_duty,
+                },
+            );
         }
 
         // --- LED colour ---

@@ -74,10 +74,16 @@ pub enum BoardToHost {
         source: BoardKind,
         payload: RelayPayload,
     },
-    /// Vehicle only: IBT-2 current-sense readings in milliamps.
-    /// `r_ma` = forward/right high-side (R_IS), `l_ma` = reverse/left (L_IS).
-    /// Only the active-direction channel reads non-zero.
+    /// Vehicle only: IBT-2 current-sense readings in milliamps (offset-subtracted,
+    /// scaled). `r_ma` = right/`R_IS` channel, `l_ma` = left/`L_IS` channel.
+    /// NOTE: the channel↔drive-direction mapping and the mA scale are **not yet
+    /// verified** — see the calibration procedure in `vehicle/src/ibt2.rs`.
     CurrentSense { r_ma: u16, l_ma: u16 },
+    /// Vehicle only: raw IBT-2 current-sense diagnostics for calibration — the
+    /// averaged IS voltages in millivolts (`r_mv`, `l_mv`, before offset subtraction)
+    /// alongside the commanded motor `duty` at sample time. Pair with a multimeter to
+    /// derive the offset/scale and confirm the channel↔direction mapping.
+    CurrentSenseRaw { r_mv: u16, l_mv: u16, duty: i16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
