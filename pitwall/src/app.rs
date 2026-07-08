@@ -85,6 +85,7 @@ pub const HELP: &[&str] = &[
     "  led R G B  /  led off   LED override / restore auto",
     "  motor_en R_EN L_EN      vehicle: enable pins (on/off)",
     "  motor_pwm -100..100     vehicle: set motor PWM",
+    "  manual_pwm_ramp on|off  vehicle: ramp manual PWM (else instant)",
     "  remote_tele on|off      stream this board's telemetry",
     "  repair                  forget pairing, re-handshake",
     "  peer <cmd>              run <cmd> on the paired peer",

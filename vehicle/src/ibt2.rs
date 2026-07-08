@@ -75,14 +75,22 @@ pub struct CurrentReading {
 }
 
 /// Abstraction over the motor power stage so the control layer does not depend on a
-/// concrete driver. `set_pwm` takes a signed duty (`+` forward / `-` reverse / `0`
-/// coast); the joystick→duty mapping is a control-layer concern (see `drive.rs`).
+/// concrete driver. `set_pwm` takes a signed duty (`+` forward / `-` reverse); the
+/// joystick→duty mapping is a control-layer concern (see `drive.rs`).
 #[allow(async_fn_in_trait)] // crate-internal, single-threaded embassy use; no Send needed
 pub trait HBridge {
-    /// Directly set PWM duty (-100–100). `+` → RPWM active, `-` → LPWM active, `0` → coast.
+    /// Directly set PWM duty (-100–100). `+` → RPWM active, `-` → LPWM active. Note
+    /// that `0` with the enables still HIGH is an electrodynamic **brake** (both
+    /// low-side FETs conduct, shorting the motor to GND), *not* a coast — use
+    /// [`coast`](HBridge::coast)/[`stop`](HBridge::stop) (EN low) to freewheel.
     fn set_pwm(&mut self, duty: i8);
     /// Electrodynamic brake: both half-bridges enabled, both PWM inputs at 0.
     fn brake(&mut self);
+    /// Coast / freewheel: drop both half-bridge enables (EN low → high-impedance
+    /// outputs) so the motor spins down on its own. EN is lowered *before* PWM is
+    /// zeroed so there is no low-side-brake transient. Electrically identical to
+    /// [`stop`](HBridge::stop), but a normal control state rather than a fail-safe.
+    fn coast(&mut self);
     /// Fail-safe: disable both half-bridges and zero PWM outputs.
     #[allow(dead_code)] // part of the driver API; not on the current control path
     fn stop(&mut self);
@@ -195,6 +203,15 @@ impl HBridge for Ibt2<'_> {
         let _ = self.lpwm.set_duty(0);
         self.r_en.set_high();
         self.l_en.set_high();
+    }
+
+    fn coast(&mut self) {
+        // Drop the enables first so the outputs go high-impedance before PWM is
+        // zeroed — no momentary low-side brake as the duty falls to 0.
+        self.r_en.set_low();
+        self.l_en.set_low();
+        let _ = self.rpwm.set_duty(0);
+        let _ = self.lpwm.set_duty(0);
     }
 
     fn stop(&mut self) {

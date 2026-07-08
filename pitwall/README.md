@@ -73,6 +73,7 @@ cargo run --target aarch64-apple-darwin
 | `led R G B` / `led off` | Override the onboard LED / restore auto |
 | `motor_en R_EN L_EN` | Vehicle: set IBT-2 enable pins (`on/off`) |
 | `motor_pwm DUTY` | Vehicle: set motor PWM, `-100..100` |
+| `manual_pwm_ramp on\|off` | Vehicle: feed manual PWM through the slew-rate limiter (default off = instant) |
 | `remote_tele on\|off` | Stream the peer board's telemetry over the tunnel |
 | `repair` | Forget pairing and re-run the handshake |
 | `peer <cmd>` | Relay any command to the paired peer board |

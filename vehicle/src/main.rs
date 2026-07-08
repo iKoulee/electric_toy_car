@@ -49,6 +49,18 @@ type VehiclePairingStore = pairing::PairingStore<'static>;
 
 // ── Pure-logic loop state ─────────────────────────────────────────────────────
 
+/// How the motor power stage is currently driven. Tracked so the per-tick apply
+/// stage only writes the EN/brake/coast pins on a *transition*, not every tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MotorMode {
+    /// PWM actively driving (EN high); the applied duty is being ramped.
+    Driven,
+    /// Freewheeling (EN low, PWM 0) after a joystick release.
+    Coasting,
+    /// Electrodynamic brake (EN high, PWM 0) — brake button or link timeout.
+    Braking,
+}
+
 struct VehicleRunState {
     elapsed_ms: u64,
     last_state: LinkState,
@@ -64,6 +76,18 @@ struct VehicleRunState {
     /// Cleared automatically when the physical operator reclaims control by
     /// moving the joystick out of its dead zone or pressing brake.
     manual_pwm: Option<i8>,
+    /// When true, the manual override is fed through the slew-rate limiter like
+    /// joystick drive; when false it is applied instantly. Set via `SetManualPwmRamp`.
+    ramp_manual: bool,
+    /// Latest joystick-derived duty target (0 = dead-zone release → coast). The
+    /// per-tick apply stage ramps `applied_duty` toward this.
+    target_duty: i16,
+    /// Ramped duty actually driving the motor this tick (slew-limiter accumulator).
+    applied_duty: i16,
+    /// Brake button (`BUTTON_C`) latched from the last control packet.
+    brake_active: bool,
+    /// Current motor power-stage mode, so pin writes only happen on a transition.
+    motor_mode: MotorMode,
     /// Last duty commanded to the motor this tick, for `CurrentSenseRaw` telemetry.
     last_duty: i16,
 }
@@ -79,6 +103,12 @@ impl VehicleRunState {
             led_override: None,
             stream_to_peer: false,
             manual_pwm: None,
+            ramp_manual: false,
+            target_duty: 0,
+            applied_duty: 0,
+            brake_active: false,
+            // Boots enabled with PWM 0 (EN high) — that is a brake, matching the pins.
+            motor_mode: MotorMode::Braking,
             last_duty: 0,
         }
     }
@@ -107,12 +137,12 @@ fn apply_local_cmd(
         }
         HostToBoard::SetMotorPwm { duty } => {
             // Latch the manual override so it holds across control packets and
-            // link-state transitions, then apply it and report it immediately.
+            // link-state transitions; the per-tick apply stage drives it (this
+            // same tick, since the USB drain runs before it). Echo it immediately.
             s.manual_pwm = Some(duty);
-            motor.set_pwm(duty);
-            s.last_duty = duty as i16;
             emit_telemetry(link, s, BoardToHost::MotorState { duty: duty as i16 });
         }
+        HostToBoard::SetManualPwmRamp { on } => s.ramp_manual = on,
         HostToBoard::EnableRemoteTelemetry { on } => s.stream_to_peer = on,
         HostToBoard::Repair => {
             if let Some(st) = store.as_mut() {
@@ -323,18 +353,12 @@ async fn run<'radio, 'led, D: HBridge>(
                     if brake || drive::y_to_duty(received.packet.y) != 0 {
                         s.manual_pwm = None;
                     }
-                    let duty: i16 = if brake {
-                        motor.brake();
-                        0
-                    } else if let Some(pwm) = s.manual_pwm {
-                        // USB manual override holds while the joystick is centred.
-                        pwm as i16
-                    } else {
-                        let duty = drive::y_to_duty(received.packet.y);
-                        motor.set_pwm(duty as i8);
-                        duty
-                    };
-                    s.last_duty = duty;
+                    // Update the commanded state only; the per-tick apply stage
+                    // owns every motor write so the ramp advances on a fixed cadence.
+                    s.brake_active = brake;
+                    if !brake && s.manual_pwm.is_none() {
+                        s.target_duty = drive::y_to_duty(received.packet.y);
+                    }
                     emit_telemetry(
                         &mut link,
                         &s,
@@ -344,7 +368,6 @@ async fn run<'radio, 'led, D: HBridge>(
                             buttons: received.packet.buttons,
                         },
                     );
-                    emit_telemetry(&mut link, &s, BoardToHost::MotorState { duty });
 
                     let tracked = ControlPacket::BUTTON_A
                         | ControlPacket::BUTTON_B
@@ -394,7 +417,8 @@ async fn run<'radio, 'led, D: HBridge>(
             let kind = match link_state {
                 LinkState::AwaitingFirstPacket => LinkStateKind::AwaitingFirstPacket,
                 LinkState::Alive => {
-                    motor.enable();
+                    // The next apply tick re-derives coast/drive from `target_duty`
+                    // (0 until a fresh packet arrives), so no motor write here.
                     for _ in 0..2 {
                         let _ = common_led::set_rgb(&mut led, 0, 0, 16);
                         Timer::after_millis(200).await;
@@ -405,10 +429,14 @@ async fn run<'radio, 'led, D: HBridge>(
                 }
                 LinkState::TimedOut => {
                     link.reset_sequence();
-                    // brake() keeps H-bridges enabled so USB SetMotorPwm commands
-                    // take effect immediately while timed-out. A latched manual
-                    // override (`s.manual_pwm`) is re-asserted after this each tick,
-                    // so a computer keeps direct motor control via USB cable.
+                    // Reset the ramp so a stale nonzero target can't drive the motor
+                    // with the RF link dead; the apply stage then holds brake every
+                    // tick (its `TimedOut` branch). brake() keeps H-bridges enabled
+                    // so a latched USB `manual_pwm` still takes effect immediately.
+                    s.target_duty = 0;
+                    s.applied_duty = 0;
+                    s.brake_active = false;
+                    s.motor_mode = MotorMode::Braking;
                     motor.brake();
                     s.last_duty = 0;
                     LinkStateKind::TimedOut
@@ -423,15 +451,53 @@ async fn run<'radio, 'led, D: HBridge>(
             apply_local_cmd(cmd, &mut motor, &mut s, &mut link, &mut store);
         }
 
-        // --- Hold manual PWM ---
-        // Re-assert the USB manual override every tick so control-packet handling
-        // and link-state transitions (notably the timeout brake) cannot leave it
-        // at zero. Runs regardless of link state, matching the documented intent
-        // that a USB host can drive the motor even while the RF link is down.
+        // --- Motor apply stage ---
+        // The single owner of every motor write, run each tick after the link-state
+        // machine and USB drain (so `link_state` and the latest command are known).
+        // Priority: manual USB override > safety brake > dead-zone coast > ramped drive.
         if let Some(pwm) = s.manual_pwm {
-            motor.set_pwm(pwm);
-            s.last_duty = pwm as i16;
+            // USB host keeps direct control even while the RF link is down. Ramp it
+            // only when explicitly requested; otherwise apply the exact commanded duty.
+            if s.motor_mode == MotorMode::Coasting {
+                motor.enable();
+            }
+            s.applied_duty = if s.ramp_manual {
+                drive::ramp_duty(s.applied_duty, pwm as i16, drive::ACCEL_STEP, drive::DECEL_STEP)
+            } else {
+                pwm as i16
+            };
+            motor.set_pwm(s.applied_duty as i8);
+            s.motor_mode = MotorMode::Driven;
+        } else if s.brake_active || link_state == LinkState::TimedOut {
+            // Safety brake is immediate (no ramp).
+            if s.motor_mode != MotorMode::Braking {
+                motor.brake();
+            }
+            s.applied_duty = 0;
+            s.motor_mode = MotorMode::Braking;
+        } else if s.target_duty == 0 {
+            // Joystick released to the dead zone → freewheel (EN low before PWM 0).
+            if s.motor_mode != MotorMode::Coasting {
+                motor.coast();
+            }
+            s.applied_duty = 0;
+            s.motor_mode = MotorMode::Coasting;
+        } else {
+            // Normal drive: ramp the applied duty toward the joystick target.
+            if s.motor_mode == MotorMode::Coasting {
+                motor.enable();
+            }
+            s.applied_duty = drive::ramp_duty(
+                s.applied_duty,
+                s.target_duty,
+                drive::ACCEL_STEP,
+                drive::DECEL_STEP,
+            );
+            motor.set_pwm(s.applied_duty as i8);
+            s.motor_mode = MotorMode::Driven;
         }
+        s.last_duty = s.applied_duty;
+        emit_telemetry(&mut link, &s, BoardToHost::MotorState { duty: s.applied_duty });
 
         // --- Current sense ---
         // Sample the IBT-2 IS pins every 4th tick (~200 ms) so the reading does

@@ -70,6 +70,7 @@ fn handle_cmd(frame: &mut [u8]) -> Option<BoardToHost> {
         | Ok(cmd @ HostToBoard::SetMotorPwm { .. })
         | Ok(cmd @ HostToBoard::ForPeer(_))
         | Ok(cmd @ HostToBoard::EnableRemoteTelemetry { .. })
+        | Ok(cmd @ HostToBoard::SetManualPwmRamp { .. })
         | Ok(cmd @ HostToBoard::Repair) => {
             // Forwarded to the main loop, which owns the radio and pairing store.
             if CMDS.try_send(cmd).is_err() {

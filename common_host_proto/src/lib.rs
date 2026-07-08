@@ -37,7 +37,8 @@ pub enum HostToBoard {
     /// Vehicle only: directly set IBT-2 R_EN and L_EN enable pins.
     SetMotorEnable { r_en: bool, l_en: bool },
     /// Vehicle only: directly set IBT-2 PWM duty (-100–100).
-    /// Positive → RPWM active, LPWM=0. Negative → LPWM active, RPWM=0. Zero → both 0 (coast).
+    /// Positive → RPWM active, LPWM=0. Negative → LPWM active, RPWM=0. Zero with
+    /// the enables high is an electrodynamic brake, not a coast.
     SetMotorPwm { duty: i8 },
     /// Relay an opaque host→board message to the paired peer board over the
     /// ESP-NOW tunnel. The gateway forwards the bytes verbatim; the remote board
@@ -50,6 +51,12 @@ pub enum HostToBoard {
     /// Forget the stored pairing and re-run the pairing handshake. Wrap in
     /// [`HostToBoard::ForPeer`] to re-pair the remote board.
     Repair,
+    /// Vehicle only: when `on`, a latched manual PWM override ([`SetMotorPwm`]) is
+    /// fed through the same slew-rate limiter (ramp) as joystick drive instead of
+    /// applied instantly. Off by default so the host sees the exact duty it commands.
+    ///
+    /// [`SetMotorPwm`]: HostToBoard::SetMotorPwm
+    SetManualPwmRamp { on: bool },
 }
 
 /// Messages from board → host.

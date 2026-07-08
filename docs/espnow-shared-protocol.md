@@ -122,6 +122,9 @@ the **remote**. The PC sees both boards through one USB connection.
 - Telemetry streaming is **off by default** and enabled per-board with
   `HostToBoard::EnableRemoteTelemetry { on }` (typically sent `ForPeer`-wrapped to
   the remote). This saves airtime and controller battery in normal operation.
+- `HostToBoard::SetManualPwmRamp { on }` (vehicle only) selects whether a latched
+  manual PWM override (`SetMotorPwm`) is fed through the motor slew-rate limiter or
+  applied instantly. Off by default so the host sees the exact duty it commands.
 
 COBS framing is used **only** on the USB byte stream. The ESP-NOW tunnel carries
 the raw payload, because the frame envelope plus ESP-NOW itself already delimit
@@ -134,4 +137,5 @@ frames.
 - `EspNowLink` (bidirectional) is wired into both boards via the board-specific
   `Esp32C6EspNow` transport adapter, including peer management.
 - Both `controller` and `vehicle` run the gateway/remote routing and flash-backed
-  pairing; `pitwall` (host-side TUI dashboard) exposes `peer <cmd>`, `remote_tele on|off`, and `repair`.
+  pairing; `pitwall` (host-side TUI dashboard) exposes `peer <cmd>`, `remote_tele on|off`,
+  `manual_pwm_ramp on|off`, and `repair`.

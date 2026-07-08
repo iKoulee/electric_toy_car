@@ -38,6 +38,7 @@ pub fn parse_command(input: &str) -> Option<HostToBoard> {
             Some(HostToBoard::SetMotorPwm { duty })
         }
         ["remote_tele", s] => Some(HostToBoard::EnableRemoteTelemetry { on: parse_bool(s)? }),
+        ["manual_pwm_ramp", s] => Some(HostToBoard::SetManualPwmRamp { on: parse_bool(s)? }),
         ["repair"] => Some(HostToBoard::Repair),
         // Relay any other command to the peer board via the gateway: parse the
         // remainder recursively and wrap its raw encoding in ForPeer.
