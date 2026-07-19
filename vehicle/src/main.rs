@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod board;
+mod config;
 mod drive;
 mod esp_now_transport;
 mod hbridge;
@@ -19,7 +21,7 @@ use common_host_proto::{
     decode_host_payload, encode_board_payload, BoardKind, BoardToHost, HostToBoard, LinkStateKind,
     RelayPayload, RELAY_PAYLOAD_MAX,
 };
-use common_led::{LED_BUFFER_SIZE, LedPulseCode, Ws2812Led};
+use common_led::{LedPulseCode, Ws2812Led, LED_BUFFER_SIZE};
 use embassy_executor::Spawner;
 use embassy_time::Timer;
 use esp_backtrace as _;
@@ -39,10 +41,7 @@ use esp_hal::{
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const VEHICLE_LOOP_INTERVAL_MS: u64 = 50;
-/// Max ESP-NOW frames drained per tick, so a burst of control + tunnel frames
-/// does not starve either path (the radio RX queue is 10 deep).
-const MAX_RX_DRAIN_PER_TICK: usize = 8;
+use config::timing::{LOOP_INTERVAL_MS, MAX_RX_DRAIN_PER_TICK};
 
 /// The vehicle's concrete ESP-NOW link type.
 type VehicleEspLink<'r> = EspNowLink<esp_now_transport::Esp32C6EspNow<'r>>;
@@ -154,7 +153,8 @@ async fn main(spawner: Spawner) -> ! {
     // Hold BOOT (GPIO9) low during reset to clear the stored pairing and force a
     // fresh handshake. Otherwise load the paired peer MAC so the link comes up
     // in unicast immediately.
-    let boot_btn = Input::new(p.GPIO9, InputConfig::default().with_pull(Pull::Up));
+    let pins = board::vehicle_pins!(p);
+    let boot_btn = Input::new(pins.boot, InputConfig::default().with_pull(Pull::Up));
     let repair_requested = boot_btn.is_low();
     let mut pairing_store: Option<VehiclePairingStore> = pairing::PairingStore::new(p.FLASH);
     if repair_requested {
@@ -206,7 +206,7 @@ async fn main(spawner: Spawner) -> ! {
         })
         .expect("LEDC timer config failed");
 
-    let mut rpwm = ledc.channel::<LowSpeed>(channel::Number::Channel0, p.GPIO2);
+    let mut rpwm = ledc.channel::<LowSpeed>(channel::Number::Channel0, pins.rpwm);
     rpwm.configure(channel::config::Config {
         timer: &pwm_timer,
         duty_pct: 0,
@@ -214,7 +214,7 @@ async fn main(spawner: Spawner) -> ! {
     })
     .expect("RPWM channel config failed");
 
-    let mut lpwm = ledc.channel::<LowSpeed>(channel::Number::Channel1, p.GPIO3);
+    let mut lpwm = ledc.channel::<LowSpeed>(channel::Number::Channel1, pins.lpwm);
     lpwm.configure(channel::config::Config {
         timer: &pwm_timer,
         duty_pct: 0,
@@ -222,19 +222,18 @@ async fn main(spawner: Spawner) -> ! {
     })
     .expect("LPWM channel config failed");
 
-    let r_en = Output::new(p.GPIO4, Level::High, OutputConfig::default());
-    let l_en = Output::new(p.GPIO5, Level::High, OutputConfig::default());
+    let r_en = Output::new(pins.r_en, Level::High, OutputConfig::default());
+    let l_en = Output::new(pins.l_en, Level::High, OutputConfig::default());
     // Traction: one IBT-2 driver owns motor control + current sense: ADC1 on GPIO0
     // (R_IS) and GPIO1 (L_IS).
-    let mut driver = ibt2::Ibt2::new(rpwm, lpwm, r_en, l_en, p.ADC1, p.GPIO0, p.GPIO1);
+    let mut driver = ibt2::Ibt2::new(rpwm, lpwm, r_en, l_en, p.ADC1, pins.r_is, pins.l_is);
 
     // Capture the idle current-sense baseline before driving the motor.
     driver.calibrate_offset().await;
 
     // Steering: L298N bridge A, IN1/IN2 as two PWM inputs on the same 9765 Hz timer.
     // ENA is left on the module jumper (always enabled), so no GPIO is wired for it.
-    // NOTE: confirm the IN1/IN2 GPIOs against the physical board.
-    let mut in1 = ledc.channel::<LowSpeed>(channel::Number::Channel2, p.GPIO6);
+    let mut in1 = ledc.channel::<LowSpeed>(channel::Number::Channel2, pins.steer_in1);
     in1.configure(channel::config::Config {
         timer: &pwm_timer,
         duty_pct: 0,
@@ -242,7 +241,7 @@ async fn main(spawner: Spawner) -> ! {
     })
     .expect("L298N IN1 channel config failed");
 
-    let mut in2 = ledc.channel::<LowSpeed>(channel::Number::Channel3, p.GPIO7);
+    let mut in2 = ledc.channel::<LowSpeed>(channel::Number::Channel3, pins.steer_in2);
     in2.configure(channel::config::Config {
         timer: &pwm_timer,
         duty_pct: 0,
@@ -256,7 +255,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // ── Transport + LED setup ─────────────────────────────────────────────────
 
-    let (link, led, rx_buf) = setup(esp_now, p.RMT, p.GPIO8, &mut led_buf).await;
+    let (link, led, rx_buf) = setup(esp_now, p.RMT, pins.led, &mut led_buf).await;
 
     // ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -514,13 +513,17 @@ async fn run<'radio, 'led, D: HBridge, S: HBridge>(
                 LinkState::TimedOut => {
                     let blink = s.led_toggle;
                     s.led_toggle = !s.led_toggle;
-                    if blink { (16, 0, 0) } else { (2, 0, 0) }
+                    if blink {
+                        (16, 0, 0)
+                    } else {
+                        (2, 0, 0)
+                    }
                 }
             }
         };
         let _ = common_led::set_rgb(&mut led, color.0, color.1, color.2);
 
-        Timer::after_millis(VEHICLE_LOOP_INTERVAL_MS).await;
-        s.elapsed_ms = s.elapsed_ms.saturating_add(VEHICLE_LOOP_INTERVAL_MS);
+        Timer::after_millis(LOOP_INTERVAL_MS).await;
+        s.elapsed_ms = s.elapsed_ms.saturating_add(LOOP_INTERVAL_MS);
     }
 }

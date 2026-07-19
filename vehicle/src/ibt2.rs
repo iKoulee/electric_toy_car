@@ -38,9 +38,12 @@
 //! commanded duty) vs the True-RMS load current across the range in both directions,
 //! then linear-fit averaged-mV → mA and update [`IS_SCALE_NUM`]/[`IS_SCALE_DEN`].
 
+use crate::config::current_sense::{
+    AVG_SAMPLES, CAL_SAMPLES, IS_ATTENUATION, IS_SCALE_DEN, IS_SCALE_NUM,
+};
 use crate::hbridge::{CurrentReading, HBridge};
 use esp_hal::{
-    analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin, Attenuation},
+    analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin},
     gpio::Output,
     ledc::{
         channel::{self, ChannelIFace},
@@ -49,23 +52,6 @@ use esp_hal::{
     peripherals::{ADC1, GPIO0, GPIO1},
     Async,
 };
-
-/// ADC attenuation for the IS pins (full-scale ≈ 3.3 V).
-const IS_ATTENUATION: Attenuation = Attenuation::_11dB;
-
-/// Sense scale as a rational `num/den` mA-per-mV, derived empirically from the
-/// resistive-load sweep in `docs/callibration_measurement.ods` (averaged ADC mV vs the
-/// `I_REF` True-RMS load current) — the divider + RC ratio is baked in, so this is not
-/// the datasheet `8.5 mA/mV`. Confirm against a fresh sweep after any change to the
-/// analog chain (see module docs); provisional value pending final RC-filter build.
-const IS_SCALE_NUM: u32 = 16;
-const IS_SCALE_DEN: u32 = 1;
-
-/// Samples averaged per channel in [`Ibt2::read_current`]. The RC low-pass on the IS
-/// node does the heavy lifting; this averaging is cheap insurance against ADC noise.
-const AVG_SAMPLES: u32 = 16;
-/// Samples averaged per channel when capturing the idle baseline.
-const CAL_SAMPLES: u32 = 32;
 
 type IsPin<'d, GPIO> = AdcPin<GPIO, ADC1<'d>, AdcCalCurve<ADC1<'d>>>;
 
