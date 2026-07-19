@@ -5,8 +5,7 @@
 //! decision that a different input source could replace. The Y axis drives traction
 //! (IBT-2); the X axis steers (L298N).
 
-const DEAD_ZONE: u8 = 10;
-const CENTER: u8 = 127;
+use crate::config::motor::{CENTER, DEAD_ZONE};
 
 /// Map a joystick axis (0–255, center = 127, dead-zone ±10) to a signed duty level
 /// (positive = high end, negative = low end, 0 = centred), clamped to ±100.

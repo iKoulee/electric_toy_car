@@ -1,20 +1,22 @@
 #![no_std]
 #![no_main]
 
+mod board;
+mod config;
 mod esp_now_transport;
 mod joystick;
 mod pairing;
 mod usb_link;
 
-use common_comms::espnow::{BROADCAST_ADDRESS, EspNowLink, Inbound};
+use common_comms::espnow::{EspNowLink, Inbound, BROADCAST_ADDRESS};
 use common_comms::frame::MAX_ENCODED_FRAME;
-use common_comms::protocol::{CONTROL_TX_INTERVAL_MS, ControlPacket};
+use common_comms::protocol::{ControlPacket, CONTROL_TX_INTERVAL_MS};
 use common_host_proto::{
     decode_host_payload, encode_board_payload, BoardKind, BoardToHost, HostToBoard, RelayPayload,
     RELAY_PAYLOAD_MAX,
 };
 use embassy_executor::Spawner;
-use embassy_time::{Duration as EmbassyDuration, TimeoutError, Timer, with_timeout};
+use embassy_time::{with_timeout, Duration as EmbassyDuration, TimeoutError, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
@@ -22,42 +24,26 @@ use esp_hal::{
     i2c::master::{Config as I2cConfig, I2c},
     interrupt::software::SoftwareInterruptControl,
     rmt::Rmt,
-    timer::timg::TimerGroup,
     time::Rate,
+    timer::timg::TimerGroup,
     usb_serial_jtag::UsbSerialJtag,
 };
 
+use config::control::{MAX_RX_DRAIN_PER_TICK, READ_FAILURES_BEFORE_NEUTRAL_KEEPALIVE};
+use config::diag::{
+    ERROR_LOG_PERIOD, PRINT_ON_CHANGE_ONLY, RUN_SCAN, RUN_STARTUP_PROBES, SAMPLE_LOGS_ENABLED,
+    TX_LOGS_ENABLED,
+};
+use config::i2c::FREQUENCY_KHZ;
+use config::joystick::DEFAULT_ADDRESS;
+use config::timing::{LOOP_TICK_MS, READ_TIMEOUT_MS, STATUS_LOG_INTERVAL_MS};
 use joystick::{
-    I2cScanSummary,
-    JOYSTICK_DEFAULT_ADDRESS,
-    I2C_FREQUENCY_KHZ,
-    RUN_I2C_SCAN,
-    RUN_STARTUP_PROBES,
-    decode_joystick_state,
-    encode_buttons,
-    neutral_joystick_state,
-    print_joystick_status,
-    print_runtime_state,
-    read_joystick_runtime_frame_async,
-    resolve_active_joystick_address,
-    run_i2c_joystick_diagnostics,
-    run_joystick_dynamic_probe,
-    scan_i2c_bus,
+    decode_joystick_state, encode_buttons, neutral_joystick_state, print_joystick_status,
+    print_runtime_state, read_joystick_runtime_frame_async, resolve_active_joystick_address,
+    run_i2c_joystick_diagnostics, run_joystick_dynamic_probe, scan_i2c_bus, I2cScanSummary,
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
-
-const CONTROL_LOOP_TICK_MS: u64 = 10;
-// At 10kHz, a write_read of 38-byte frame can exceed 30ms; keep timeout above transfer worst-case.
-const JOYSTICK_READ_TIMEOUT_MS: u64 = 80;
-const READ_FAILURES_BEFORE_NEUTRAL_KEEPALIVE: u8 = 3;
-const JOYSTICK_ERROR_LOG_PERIOD: u8 = 10;
-const JOYSTICK_STATUS_LOG_INTERVAL_MS: u64 = 250;
-const JOYSTICK_SAMPLE_LOGS_ENABLED: bool = false;
-const JOYSTICK_PRINT_ON_CHANGE_ONLY: bool = true;
-const CONTROL_TX_LOGS_ENABLED: bool = false;
-/// Max ESP-NOW frames drained per tick (pairing acks + tunnel frames).
-const MAX_RX_DRAIN_PER_TICK: usize = 8;
 
 /// The controller's concrete ESP-NOW link type.
 type ControllerEspLink<'r> = EspNowLink<esp_now_transport::Esp32C6EspNow<'r>>;
@@ -113,7 +99,8 @@ async fn main(spawner: Spawner) -> ! {
     // Pairing persistence + re-pair gesture: hold BOOT (GPIO9) low during reset
     // to clear the stored pairing and force a fresh handshake; otherwise load the
     // paired vehicle MAC so control comes up in unicast immediately.
-    let boot_btn = Input::new(peripherals.GPIO9, InputConfig::default().with_pull(Pull::Up));
+    let pins = board::controller_pins!(peripherals);
+    let boot_btn = Input::new(pins.boot, InputConfig::default().with_pull(Pull::Up));
     let repair_requested = boot_btn.is_low();
     let mut pairing_store: Option<ControllerPairingStore> =
         pairing::PairingStore::new(peripherals.FLASH);
@@ -125,7 +112,9 @@ async fn main(spawner: Spawner) -> ! {
     let stored_peer = pairing_store.as_mut().and_then(|s| s.load());
 
     let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
-    spawner.spawn(usb_link::task(usb)).expect("usb_link task spawn failed");
+    spawner
+        .spawn(usb_link::task(usb))
+        .expect("usb_link task spawn failed");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -140,7 +129,9 @@ async fn main(spawner: Spawner) -> ! {
         .expect("WiFi set mode failed");
     wifi_ctrl.start().expect("WiFi start failed");
     let esp_now = interfaces.esp_now;
-    esp_now.set_channel(1).expect("Failed to set ESP-NOW channel");
+    esp_now
+        .set_channel(1)
+        .expect("Failed to set ESP-NOW channel");
 
     let delay = Delay::new();
 
@@ -151,24 +142,24 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::println!(
         "Configuring I2C0 at {} kHz on GPIO6(SDA)/GPIO7(SCL)",
-        I2C_FREQUENCY_KHZ
+        FREQUENCY_KHZ
     );
-    let i2c_config = I2cConfig::default().with_frequency(Rate::from_khz(I2C_FREQUENCY_KHZ));
+    let i2c_config = I2cConfig::default().with_frequency(Rate::from_khz(FREQUENCY_KHZ));
     let mut i2c = I2c::new(peripherals.I2C0, i2c_config)
         .expect("Failed to initialize I2C0")
-        .with_sda(peripherals.GPIO6)
-        .with_scl(peripherals.GPIO7);
+        .with_sda(pins.sda)
+        .with_scl(pins.scl);
 
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
     let mut led_buf = common_led::ws2812_buffer!();
-    let mut led = common_led::new_ws2812(rmt.channel0, peripherals.GPIO8, &mut led_buf);
+    let mut led = common_led::new_ws2812(rmt.channel0, pins.led, &mut led_buf);
     let mut led_toggle = false;
 
     if let Err(error) = common_led::set_rgb(&mut led, 0, 16, 0) {
         esp_println::println!("Failed to set controller boot LED color: {:?}", error);
     }
 
-    let scan_summary = if RUN_I2C_SCAN {
+    let scan_summary = if RUN_SCAN {
         let summary = scan_i2c_bus(&mut i2c);
         if let Some(found) = summary.first_found {
             esp_println::println!(
@@ -179,8 +170,13 @@ async fn main(spawner: Spawner) -> ! {
         }
         summary
     } else {
-        esp_println::println!("Skipping full I2C scan; using validated joystick candidate probing.");
-        I2cScanSummary { found_count: 0, first_found: None }
+        esp_println::println!(
+            "Skipping full I2C scan; using validated joystick candidate probing."
+        );
+        I2cScanSummary {
+            found_count: 0,
+            first_found: None,
+        }
     };
 
     if RUN_STARTUP_PROBES {
@@ -200,7 +196,7 @@ async fn main(spawner: Spawner) -> ! {
     } else {
         esp_println::println!(
             "Warning: could not resolve a working joystick address; last known default is 0x{:02X}.",
-            JOYSTICK_DEFAULT_ADDRESS
+            DEFAULT_ADDRESS
         );
     }
 
@@ -218,7 +214,7 @@ async fn main(spawner: Spawner) -> ! {
     // Start at interval so an immediate keepalive fires on the first tick.
     let mut ticks_since_tx: u64 = CONTROL_TX_INTERVAL_MS;
     let mut consecutive_read_failures: u8 = 0;
-    let mut ticks_since_status_log: u64 = JOYSTICK_STATUS_LOG_INTERVAL_MS;
+    let mut ticks_since_status_log: u64 = STATUS_LOG_INTERVAL_MS;
     // LED override from USB host: None = automatic state-driven color.
     let mut led_override: Option<[u8; 3]> = None;
     // Whether this board mirrors its telemetry to the peer over the tunnel.
@@ -280,7 +276,7 @@ async fn main(spawner: Spawner) -> ! {
         let mut tx_state = last_transmitted_state.unwrap_or_else(neutral_joystick_state);
 
         match with_timeout(
-            EmbassyDuration::from_millis(JOYSTICK_READ_TIMEOUT_MS),
+            EmbassyDuration::from_millis(READ_TIMEOUT_MS),
             read_joystick_runtime_frame_async(&mut i2c, active_joystick_address),
         )
         .await
@@ -306,7 +302,7 @@ async fn main(spawner: Spawner) -> ! {
                     );
                 }
 
-                if JOYSTICK_SAMPLE_LOGS_ENABLED && (!JOYSTICK_PRINT_ON_CHANGE_ONLY || changed) {
+                if SAMPLE_LOGS_ENABLED && (!PRINT_ON_CHANGE_ONLY || changed) {
                     let button_mask = encode_buttons(&state.buttons);
                     let preview = ControlPacket::new(tx_seq, state.x, state.y, button_mask);
                     print_runtime_state(tx_seq as u32, address, &state, &preview, "sample");
@@ -314,7 +310,7 @@ async fn main(spawner: Spawner) -> ! {
 
                 last_sampled_state = Some(state);
 
-                if changed && ticks_since_status_log >= JOYSTICK_STATUS_LOG_INTERVAL_MS {
+                if changed && ticks_since_status_log >= STATUS_LOG_INTERVAL_MS {
                     print_joystick_status(&state, consecutive_read_failures);
                     ticks_since_status_log = 0;
                 }
@@ -322,11 +318,11 @@ async fn main(spawner: Spawner) -> ! {
             Ok(Err(error)) => {
                 consecutive_read_failures = consecutive_read_failures.saturating_add(1);
                 if consecutive_read_failures == 1
-                    || consecutive_read_failures.is_multiple_of(JOYSTICK_ERROR_LOG_PERIOD)
+                    || consecutive_read_failures.is_multiple_of(ERROR_LOG_PERIOD)
                 {
                     esp_println::println!(
                         "Joystick read failed at 0x{:02X}: {} (consecutive={})",
-                        active_joystick_address.unwrap_or(JOYSTICK_DEFAULT_ADDRESS),
+                        active_joystick_address.unwrap_or(DEFAULT_ADDRESS),
                         error,
                         consecutive_read_failures
                     );
@@ -335,12 +331,12 @@ async fn main(spawner: Spawner) -> ! {
             Err(TimeoutError) => {
                 consecutive_read_failures = consecutive_read_failures.saturating_add(1);
                 if consecutive_read_failures == 1
-                    || consecutive_read_failures.is_multiple_of(JOYSTICK_ERROR_LOG_PERIOD)
+                    || consecutive_read_failures.is_multiple_of(ERROR_LOG_PERIOD)
                 {
                     esp_println::println!(
                         "Joystick read timed out at 0x{:02X} after {} ms (consecutive={})",
-                        active_joystick_address.unwrap_or(JOYSTICK_DEFAULT_ADDRESS),
-                        JOYSTICK_READ_TIMEOUT_MS,
+                        active_joystick_address.unwrap_or(DEFAULT_ADDRESS),
+                        READ_TIMEOUT_MS,
                         consecutive_read_failures
                     );
                 }
@@ -364,10 +360,14 @@ async fn main(spawner: Spawner) -> ! {
 
             match link.send_control(packet) {
                 Ok(()) => {
-                    if CONTROL_TX_LOGS_ENABLED {
+                    if TX_LOGS_ENABLED {
                         esp_println::println!(
                             "ESP-NOW sent #{} ({}) x={} y={} btn={:#04x}",
-                            tx_seq, reason, tx_state.x, tx_state.y, button_mask
+                            tx_seq,
+                            reason,
+                            tx_state.x,
+                            tx_state.y,
+                            button_mask
                         );
                     }
                 }
@@ -376,10 +376,10 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
 
-            if CONTROL_TX_LOGS_ENABLED {
+            if TX_LOGS_ENABLED {
                 print_runtime_state(
                     tx_seq as u32,
-                    active_joystick_address.unwrap_or(JOYSTICK_DEFAULT_ADDRESS),
+                    active_joystick_address.unwrap_or(DEFAULT_ADDRESS),
                     &tx_state,
                     &packet,
                     reason,
@@ -414,8 +414,8 @@ async fn main(spawner: Spawner) -> ! {
             esp_println::println!("Failed to update controller LED color: {:?}", error);
         }
 
-        Timer::after_millis(CONTROL_LOOP_TICK_MS).await;
-        ticks_since_tx = ticks_since_tx.saturating_add(CONTROL_LOOP_TICK_MS);
-        ticks_since_status_log = ticks_since_status_log.saturating_add(CONTROL_LOOP_TICK_MS);
+        Timer::after_millis(LOOP_TICK_MS).await;
+        ticks_since_tx = ticks_since_tx.saturating_add(LOOP_TICK_MS);
+        ticks_since_status_log = ticks_since_status_log.saturating_add(LOOP_TICK_MS);
     }
 }
