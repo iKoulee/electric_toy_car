@@ -75,14 +75,14 @@ pub enum BoardToHost {
         payload: RelayPayload,
     },
     /// Vehicle only: IBT-2 current-sense readings in milliamps (offset-subtracted,
-    /// scaled). `r_ma` = right/`R_IS` channel, `l_ma` = left/`L_IS` channel.
-    /// NOTE: the channel↔drive-direction mapping and the mA scale are **not yet
-    /// verified** — see the calibration procedure in `vehicle/src/ibt2.rs`.
+    /// scaled). `r_ma` = right/`R_IS` channel (active on forward), `l_ma` =
+    /// left/`L_IS` channel (active on reverse). Scale calibrated against a load
+    /// sweep — see `docs/current-sense-calibration.md`.
     CurrentSense { r_ma: u16, l_ma: u16 },
-    /// Vehicle only: raw IBT-2 current-sense diagnostics for calibration — the
+    /// Vehicle only: raw IBT-2 current-sense diagnostics for re-calibration — the
     /// averaged IS voltages in millivolts (`r_mv`, `l_mv`, before offset subtraction)
-    /// alongside the commanded motor `duty` at sample time. Pair with a multimeter to
-    /// derive the offset/scale and confirm the channel↔direction mapping.
+    /// alongside the commanded motor `duty` at sample time. Pair with a True-RMS meter
+    /// to re-derive the offset/scale after any change to the analog chain.
     CurrentSenseRaw { r_mv: u16, l_mv: u16, duty: i16 },
 }
 

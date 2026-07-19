@@ -5,32 +5,38 @@
 //! # Current sensing
 //!
 //! Each BTS7960 half-bridge drives an `IS` pin that, in normal operation, sources a
-//! current proportional to its high-side load current (datasheet §4.4.4). The IBT-2
-//! ties each `IS` to GND through a sense resistor (nominally 1 kΩ); with the nominal
-//! ratio `k_ILIS = I_L / I_IS ≈ 8500` that gives `V_IS = I_L / 8.5` → `8.5 mA/mV`.
+//! current proportional to its high-side load current (datasheet §4.4.4). On this
+//! board the `IS` output feeds an analog chain before the ADC:
 //!
-//! The two IS outputs are read with ADC1 on GPIO0 (`R_IS`) and GPIO1 (`L_IS`) using
-//! calibrated curve reads that return millivolts directly.
+//! ```text
+//! IS ──[ 10 kΩ IS→GND sense R ]── voltage divider ── RC low-pass ── ADC1 (GPIO0/1)
+//! ```
 //!
-//! ## ⚠️ Calibration is UNVERIFIED
+//! The IBT-2's `IS`→GND resistor is **10 kΩ** (not the 1 kΩ the datasheet examples
+//! assume). With `k_ILIS = I_L / I_IS ≈ 8500` that raises `V_IS` above the 3.3 V ADC
+//! reference at full load, so a **voltage divider** was added on the `IS` output to
+//! bring it back into range. An **RC low-pass** (fc ≈ 30–100 Hz) on the divider node
+//! smooths the ~9.77 kHz PWM ripple so the ADC sees stable DC — without it a handful
+//! of ADC samples alias the pulse-train and the reading is noisy and biased low.
 //!
-//! Field measurements show a large (~1.84 V) reading at true-zero current, weakly
-//! correlated with the real load — the signature of a **floating / unloaded IS pin**
-//! (missing or wrong IS→GND resistor), and the active channel appears **swapped**
-//! versus the direction assumption below. [`Ibt2::calibrate_offset`] captures the
-//! idle baseline and [`read_current`](Ibt2::read_current) subtracts it and averages
-//! several samples, but the scale ([`IS_SCALE_NUM`] / [`IS_SCALE_DEN`]) and the
-//! R/L↔direction mapping still need a proper resistive-load sweep to lock in.
+//! The two divider/RC outputs are read with ADC1 on GPIO0 (`R_IS`) and GPIO1
+//! (`L_IS`) using calibrated curve reads that return millivolts directly.
 //!
-//! ### Hardware verification + calibration procedure
-//! 1. **Power off**, measure resistance IS→GND for each channel — expect ~1 kΩ.
-//!    If open/high the IS pin is unloaded; fit a 1 kΩ (per datasheet) IS→GND resistor.
-//!    This is the prime suspect for the phantom baseline.
-//! 2. Confirm which physical IS pin maps to `R_IS`/`L_IS` and to GPIO0/GPIO1.
-//! 3. Drive fixed PWM steps into a known power resistor, record multimeter amps vs the
-//!    `CurrentSenseRaw` telemetry (raw mV + commanded duty) across the range, then
-//!    linear-fit → [`IS_SCALE_NUM`]/[`IS_SCALE_DEN`] and confirm which channel
-//!    responds to forward vs reverse.
+//! ## Calibration
+//!
+//! Because the divider and RC ratio are baked into the measured slope, the scale is
+//! derived empirically rather than from the datasheet ratio: a resistive-load sweep
+//! (`docs/callibration_measurement.ods`) maps averaged ADC mV to the True-RMS load
+//! current (`I_REF` column), giving ≈ 16 mA/mV → [`IS_SCALE_NUM`]/[`IS_SCALE_DEN`].
+//! [`Ibt2::calibrate_offset`] captures the idle baseline (~120 mV) and
+//! [`read_current`](Ibt2::read_current) subtracts it before scaling. R active on
+//! forward PWM, L active on reverse — confirmed by the sweep. See
+//! `docs/current-sense-calibration.md`.
+//!
+//! ### Re-calibration procedure
+//! Drive fixed PWM steps into a known load, record `CurrentSenseRaw` (averaged mV +
+//! commanded duty) vs the True-RMS load current across the range in both directions,
+//! then linear-fit averaged-mV → mA and update [`IS_SCALE_NUM`]/[`IS_SCALE_DEN`].
 
 use esp_hal::{
     analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin, Attenuation},
@@ -46,15 +52,17 @@ use esp_hal::{
 /// ADC attenuation for the IS pins (full-scale ≈ 3.3 V).
 const IS_ATTENUATION: Attenuation = Attenuation::_11dB;
 
-/// Sense scale as a rational `num/den` mA-per-mV. **UNVERIFIED** — datasheet nominal
-/// for the BTS7960 (`k_ILIS ≈ 8500`, 1 kΩ IS resistor) is `8.5 mA/mV = 17/2`; the
-/// observed slope was closer to ~1.25 mA/mV, so this must be re-derived from a
-/// resistive-load sweep (see module docs).
-const IS_SCALE_NUM: u32 = 17;
-const IS_SCALE_DEN: u32 = 2;
+/// Sense scale as a rational `num/den` mA-per-mV, derived empirically from the
+/// resistive-load sweep in `docs/callibration_measurement.ods` (averaged ADC mV vs the
+/// `I_REF` True-RMS load current) — the divider + RC ratio is baked in, so this is not
+/// the datasheet `8.5 mA/mV`. Confirm against a fresh sweep after any change to the
+/// analog chain (see module docs); provisional value pending final RC-filter build.
+const IS_SCALE_NUM: u32 = 16;
+const IS_SCALE_DEN: u32 = 1;
 
-/// Samples averaged per channel in [`Ibt2::read_current`] to suppress PWM-chop noise.
-const AVG_SAMPLES: u32 = 8;
+/// Samples averaged per channel in [`Ibt2::read_current`]. The RC low-pass on the IS
+/// node does the heavy lifting; this averaging is cheap insurance against ADC noise.
+const AVG_SAMPLES: u32 = 16;
 /// Samples averaged per channel when capturing the idle baseline.
 const CAL_SAMPLES: u32 = 32;
 
@@ -249,18 +257,18 @@ mod tests {
     use super::mv_to_ma;
 
     #[test]
-    fn conversion_matches_datasheet_ratio() {
-        // No offset: 1 kΩ, ratio 8.5 → 1000 mV -> 8.5 A.
+    fn conversion_matches_calibrated_scale() {
+        // Empirical scale from the load sweep: 16 mA/mV → 1000 mV -> 16 A.
         assert_eq!(mv_to_ma(0, 0), 0);
-        assert_eq!(mv_to_ma(1000, 0), 8500);
+        assert_eq!(mv_to_ma(1000, 0), 16000);
         // Saturates rather than wrapping past the u16 ceiling.
         assert_eq!(mv_to_ma(u16::MAX, 0), u16::MAX);
     }
 
     #[test]
     fn offset_is_subtracted_and_saturates_at_zero() {
-        // Baseline removed before scaling.
-        assert_eq!(mv_to_ma(1200, 200), 8500);
+        // Baseline removed before scaling: (1200 - 200) * 16 = 16000.
+        assert_eq!(mv_to_ma(1200, 200), 16000);
         // Readings below the baseline clamp to zero, never wrap.
         assert_eq!(mv_to_ma(100, 200), 0);
     }
