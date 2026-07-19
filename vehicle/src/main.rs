@@ -3,11 +3,13 @@
 
 mod drive;
 mod esp_now_transport;
+mod hbridge;
 mod ibt2;
+mod l298n;
 mod pairing;
 mod usb_link;
 
-use ibt2::HBridge;
+use hbridge::HBridge;
 
 use common_comms::espnow::{EspNowLink, Inbound, BROADCAST_ADDRESS};
 use common_comms::frame::MAX_ENCODED_FRAME;
@@ -222,12 +224,33 @@ async fn main(spawner: Spawner) -> ! {
 
     let r_en = Output::new(p.GPIO4, Level::High, OutputConfig::default());
     let l_en = Output::new(p.GPIO5, Level::High, OutputConfig::default());
-    // One IBT-2 driver owns motor control + current sense: ADC1 on GPIO0 (R_IS) and
-    // GPIO1 (L_IS).
+    // Traction: one IBT-2 driver owns motor control + current sense: ADC1 on GPIO0
+    // (R_IS) and GPIO1 (L_IS).
     let mut driver = ibt2::Ibt2::new(rpwm, lpwm, r_en, l_en, p.ADC1, p.GPIO0, p.GPIO1);
 
     // Capture the idle current-sense baseline before driving the motor.
     driver.calibrate_offset().await;
+
+    // Steering: L298N bridge A, IN1/IN2 as two PWM inputs on the same 9765 Hz timer.
+    // ENA is left on the module jumper (always enabled), so no GPIO is wired for it.
+    // NOTE: confirm the IN1/IN2 GPIOs against the physical board.
+    let mut in1 = ledc.channel::<LowSpeed>(channel::Number::Channel2, p.GPIO6);
+    in1.configure(channel::config::Config {
+        timer: &pwm_timer,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .expect("L298N IN1 channel config failed");
+
+    let mut in2 = ledc.channel::<LowSpeed>(channel::Number::Channel3, p.GPIO7);
+    in2.configure(channel::config::Config {
+        timer: &pwm_timer,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .expect("L298N IN2 channel config failed");
+
+    let steer = l298n::L298n::new(in1, in2, None);
 
     let mut led_buf = common_led::ws2812_buffer!();
 
@@ -237,7 +260,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
 
-    run(link, driver, led, rx_buf, pairing_store, stored_peer).await
+    run(link, driver, steer, led, rx_buf, pairing_store, stored_peer).await
 }
 
 // ── Hardware setup (runtime · transport · LED) ────────────────────────────────
@@ -272,9 +295,10 @@ async fn setup<'radio, 'led>(
 
 // ── Main control loop ─────────────────────────────────────────────────────────
 
-async fn run<'radio, 'led, D: HBridge>(
+async fn run<'radio, 'led, D: HBridge, S: HBridge>(
     mut link: VehicleEspLink<'radio>,
     mut motor: D,
+    mut steer: S,
     mut led: Ws2812Led<'led, { LED_BUFFER_SIZE }>,
     mut rx_buf: [u8; MAX_ENCODED_FRAME],
     mut store: Option<VehiclePairingStore>,
@@ -335,6 +359,10 @@ async fn run<'radio, 'led, D: HBridge>(
                         duty
                     };
                     s.last_duty = duty;
+
+                    // Steering follows the X axis (L298N). The brake button parks the
+                    // traction motor only; steering keeps tracking the stick.
+                    steer.set_pwm(drive::x_to_steer(received.packet.x) as i8);
                     emit_telemetry(
                         &mut link,
                         &s,
@@ -395,6 +423,7 @@ async fn run<'radio, 'led, D: HBridge>(
                 LinkState::AwaitingFirstPacket => LinkStateKind::AwaitingFirstPacket,
                 LinkState::Alive => {
                     motor.enable();
+                    steer.enable();
                     for _ in 0..2 {
                         let _ = common_led::set_rgb(&mut led, 0, 0, 16);
                         Timer::after_millis(200).await;
@@ -410,6 +439,8 @@ async fn run<'radio, 'led, D: HBridge>(
                     // override (`s.manual_pwm`) is re-asserted after this each tick,
                     // so a computer keeps direct motor control via USB cable.
                     motor.brake();
+                    // Steering has no USB override, so park it hard on link loss.
+                    steer.brake();
                     s.last_duty = 0;
                     LinkStateKind::TimedOut
                 }
@@ -434,28 +465,31 @@ async fn run<'radio, 'led, D: HBridge>(
         }
 
         // --- Current sense ---
-        // Sample the IBT-2 IS pins every 4th tick (~200 ms) so the reading does
-        // not flood the 50 ms loop or the depth-8 USB event channel. Reuses the
-        // telemetry path, so it also mirrors over the tunnel when streaming.
+        // Sample the traction driver's IS pins every 4th tick (~200 ms) so the
+        // reading does not flood the 50 ms loop or the depth-8 USB event channel.
+        // Reuses the telemetry path, so it also mirrors over the tunnel when
+        // streaming. Drivers without current sense (e.g. the L298N steering motor)
+        // return None and emit nothing.
         if s.tick % 4 == 0 {
-            let c = motor.read_current().await;
-            emit_telemetry(
-                &mut link,
-                &s,
-                BoardToHost::CurrentSense {
-                    r_ma: c.r_ma,
-                    l_ma: c.l_ma,
-                },
-            );
-            emit_telemetry(
-                &mut link,
-                &s,
-                BoardToHost::CurrentSenseRaw {
-                    r_mv: c.r_mv,
-                    l_mv: c.l_mv,
-                    duty: s.last_duty,
-                },
-            );
+            if let Some(c) = motor.read_current().await {
+                emit_telemetry(
+                    &mut link,
+                    &s,
+                    BoardToHost::CurrentSense {
+                        r_ma: c.r_ma,
+                        l_ma: c.l_ma,
+                    },
+                );
+                emit_telemetry(
+                    &mut link,
+                    &s,
+                    BoardToHost::CurrentSenseRaw {
+                        r_mv: c.r_mv,
+                        l_mv: c.l_mv,
+                        duty: s.last_duty,
+                    },
+                );
+            }
         }
 
         // --- LED colour ---
